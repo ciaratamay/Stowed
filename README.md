@@ -2,7 +2,7 @@
 
 Home inventory app: what's in each room, where it should go, and searchable in a hurry. Installable web app (PWA), all data stored on the device, with backup files for safekeeping and sharing.
 
-Version 0.1.0 (stage 1: listing, locations, planned moves).
+Version 0.4.0: listing, locations, planned moves and suggestions.
 
 ## Put it online (GitHub Pages)
 
@@ -12,7 +12,7 @@ Version 0.1.0 (stage 1: listing, locations, planned moves).
 4. Open the address GitHub gives you (e.g. `https://<you>.github.io/stowed/`) on your phone.
 5. Install it: Chrome on Android → menu → "Add to Home screen" / "Install app". Safari on iPhone → Share → "Add to Home Screen".
 
-After uploading a new version, close and reopen the app once to pick it up. The version number is at the bottom of the room list and in Settings.
+After uploading a new version, close and reopen the app (sometimes twice) to pick it up. Your data stays as it is; back up first anyway. The version number is at the bottom of the room list and in Settings.
 
 ## Where your data lives
 
@@ -35,11 +35,29 @@ Everything is stored in the browser's storage on that phone. Nothing is sent any
 - **Select:** tap Select, then tap chips to pick several. Then set details for all of them, move them, group them, or delete them.
 - **Groups:** a group needs at least 2 items. If it drops to 1, it's removed and its item stays where the group was.
 - **Deleting a container:** its items go to Limbo; groups inside go to Limbo intact. Deleting a group returns its items to the container it was in. Every delete can be undone from the message that appears.
-- **Needs info** lists items missing tags, usage rooms or frequency.
+- **Used in:** leaving every room unselected means the item is used in any room (screwdrivers, say).
+- **Needs info** lists items missing tags or a frequency. Items without a frequency aren't considered for suggestions.
+- **Seasonal:** tick it under an item's frequency and choose the months it's in use (e.g. May to Sep). Outside those months it counts as rarely used, so it gets suggested for deep storage, as long as the off-season is at least the gap set in Settings (3 months by default). It keeps counting as rarely used until the start month comes round; nothing is suggested to come back early.
+- **Suggestions** tab:
+  - *Move out of prime*: by default, anything used less than weekly in a prime room, or less than monthly in prime storage in a normal room.
+  - *Move somewhere easier*: by default, anything used weekly or more in an awkward room or awkward storage.
+  - All these thresholds, the seasonal gap, the minimum sizes for group suggestions and the backup reminder can be changed in Settings › Suggestions.
+  - Emergency items are never flagged for being in a prime or awkward spot, but they are matched with groups and items sharing their tags, whatever their frequency (burn gel with the first aid group, say).
+  - Where to move to comes from a matching group (same frequency, a shared tag, a compatible room), or from a tag home.
+  - *Split group*: a group with some members suited to its spot and some not. Tap or drag items between the two sides; for a container like a pouch, drag the container to the side that keeps it.
+  - *Create group*, *Merge groups*, *Doesn't fit its group* and *Tag home* (set in a container's ⋯ settings under "Home for tags").
+  - Suggestions are stacked under the container they're about.
+  - **For:** at the top of the tab, choose the whole house, or one room or container. Each room, container (⋯) and item also has a "Suggestions for…" button. This picks which things get suggestions; where they're suggested to go can be anywhere in the house.
+  - **Accept** creates planned moves.
+  - **Dismiss** rejects that one suggestion: if there's another good place, it's offered next.
+  - **Dismiss all for this item / group** stops all suggestions for it.
+  - Both kinds of dismissal last until that item's tags, rooms or frequency change.
+  - **Reset suggestions** forgets every dismissal and works suggestions out again from scratch.
+- Arrows on chips (↓ / ↑) mark items with a suggestion to move out of prime or up from an awkward spot.
 
 ## Not built yet
 
-Suggestions (thresholds, group matching, splits), read-only shared export, printable emergency sheet.
+Read-only shared export, printable emergency sheet, intentional duplicates, frequency review, "where did you expect it?" prompt, setting a group's criteria by hand.
 
 ## Files
 

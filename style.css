@@ -265,3 +265,39 @@ main { padding: 10px 12px; }
   white-space: nowrap;
 }
 .version { color: var(--muted); font-size: 12px; text-align: center; margin-top: 16px; }
+
+/* Suggestions */
+.list-row.sug { align-items: flex-start; }
+.sug-type { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--edge, var(--muted)); margin-bottom: 2px; }
+.sug-reason { font-size: 14px; margin-top: 4px; }
+.sug-dest { font-size: 14px; font-weight: 500; margin-top: 2px; color: var(--accent); }
+.sug-actions { margin-top: 8px; }
+.chip.static { cursor: default; padding: 3px 9px; font-size: 13px; }
+.chip .mark { margin-left: 5px; font-weight: 700; color: var(--danger); }
+.chip.selected .mark { color: inherit; }
+
+/* Split sheet */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.split-side { border: 1.5px dashed var(--line); border-radius: 10px; padding: 8px; min-height: 140px; min-width: 0; }
+.split-side.drop-hover { border-color: var(--accent); background: var(--bg); }
+.split-head { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.split-side input { width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); font-size: 14px; }
+.split-side .chips { padding: 6px 0 0; }
+.chip.pouch { border-width: 2px; font-weight: 600; }
+.split-side .chip { white-space: normal; text-align: left; border-radius: 14px; }
+
+/* Suggestion stacks: one card per container */
+.sug-stack {
+  background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--edge);
+  border-radius: 10px; margin-bottom: 10px; overflow: hidden;
+}
+.sug-stack-head { font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.sug-row { padding: 8px 10px 10px; }
+.sug-row + .sug-row { border-top: 1px solid var(--line); }
+.sug-row .sug-actions { flex-wrap: wrap; }
+.scope-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.scope-bar .label { font-size: 13px; color: var(--muted); }
+.scope-btn { max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.set-head { font-size: 15px; margin: 20px 0 4px; padding-top: 12px; border-top: 1px solid var(--line); }
+.month-select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); margin: 0 4px; }
+.field > label.check { display: flex; font-size: 15px; color: var(--text); margin-top: 10px; }

@@ -4,7 +4,7 @@
    Stowed — home inventory. Local-only (IndexedDB), backup files.
    ============================================================ */
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.4.0';
 const LIMBO = 'limbo';
 const FREQS = [
   ['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'],
@@ -121,6 +121,8 @@ function freshState() {
       [LIMBO]: { id: LIMBO, kind: 'room', system: true, name: 'Limbo', emoji: '🌀', color: 'limbo', access: 'normal', parent: null, order: 0, plan: null },
     },
     items: {},
+    dismissed: {},
+    settings: Object.assign({}, SETTING_DEFAULTS),
     meta: { lastBackup: null, lastImport: null, created: Date.now() },
   };
 }
@@ -147,6 +149,10 @@ function normalize(s) {
   s.nodes = s.nodes && typeof s.nodes === 'object' ? s.nodes : {};
   s.items = s.items && typeof s.items === 'object' ? s.items : {};
   s.meta = Object.assign({ lastBackup: null, lastImport: null, created: Date.now() }, s.meta || {});
+  // Added in 0.2.0: dismissed suggestions and tag homes. Older data simply gets empty defaults.
+  s.dismissed = s.dismissed && typeof s.dismissed === 'object' ? s.dismissed : {};
+  // Added in 0.4.0: editable suggestion settings and seasonal items.
+  s.settings = normalizeSettings(s.settings);
   if (!s.nodes[LIMBO]) s.nodes[LIMBO] = freshState().nodes[LIMBO];
   const L = s.nodes[LIMBO];
   Object.assign(L, { kind: 'room', system: true, name: 'Limbo', parent: null, plan: null, order: 0, color: 'limbo' });
@@ -159,6 +165,7 @@ function normalize(s) {
     if (typeof n.order !== 'number') n.order = nextOrder();
     n.mobile = !!n.mobile;
     n.isGroup = !!n.isGroup;
+    n.homeTags = Array.isArray(n.homeTags) ? parseTags(n.homeTags.join(',')) : [];
     if (n.kind === 'room') { n.parent = null; n.plan = null; if (n.id !== LIMBO && !COLORS.includes(n.color)) n.color = 'grey'; }
     else if (!n.parent || !s.nodes[n.parent]) n.parent = LIMBO;
     if (n.plan && !s.nodes[n.plan]) n.plan = null;
@@ -177,11 +184,27 @@ function normalize(s) {
     it.tags = Array.isArray(it.tags) ? parseTags(it.tags.join(',')) : [];
     it.usage = Array.isArray(it.usage) ? it.usage.filter((r) => roomIds.has(r)) : [];
     if (!FREQ_LABEL[it.freq]) it.freq = null;
+    it.season = validSeason(it.season);
     if (!it.parent || !s.nodes[it.parent]) it.parent = LIMBO;
     if (!it.plan || !s.nodes[it.plan] || it.plan === it.parent) it.plan = null;
     if (!it.created) it.created = Date.now();
   }
   return s;
+}
+
+function validSeason(se) {
+  if (!se || typeof se !== 'object') return null;
+  const a = parseInt(se.start, 10), b = parseInt(se.end, 10);
+  return a >= 1 && a <= 12 && b >= 1 && b <= 12 ? { start: a, end: b } : null;
+}
+function normalizeSettings(o) {
+  const out = Object.assign({}, SETTING_DEFAULTS);
+  if (o && typeof o === 'object') {
+    for (const k of ['primeRoomMin', 'primeStorageMin', 'awkwardUpAt']) if (LEVEL_OPTIONS.some(([v]) => v === o[k])) out[k] = o[k];
+    const num = (k, lo, hi) => { const n = parseInt(o[k], 10); if (n >= lo && n <= hi) out[k] = n; };
+    num('seasonGap', 0, 11); num('createMin', 2, 50); num('oddOneOutMin', 3, 50); num('backupDays', 1, 365);
+  }
+  return out;
 }
 
 function within(s, targetId, ancestorId) {
@@ -203,6 +226,7 @@ const ui = {
   search: '',
   select: false,
   selected: new Set(),
+  sugScope: null, // null = whole house, or { kind: 'node' | 'item', id }
 };
 function loadUi() {
   try {
@@ -299,21 +323,27 @@ function allTags() {
   for (const it of Object.values(state.items)) for (const t of it.tags) m.set(t, (m.get(t) || 0) + 1);
   return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
+/* No usage room selected means "used in any room", so it's never missing. */
 function needsInfo(it) {
   const miss = [];
   if (!it.tags.length) miss.push('tags');
-  if (!it.usage.length) miss.push('used in');
   if (!it.freq) miss.push('frequency');
   return miss;
 }
+function usageCompatible(a, b) {
+  return !a.length || !b.length || a.some((r) => b.includes(r));
+}
+const USED_IN_LABEL = 'Used in <span class="note">(none selected = any room)</span>';
 
 /* ---------- commit / undo ---------- */
 function commit() { save(); render(); }
-function snapshot() { return JSON.stringify({ nodes: state.nodes, items: state.items }); }
+function snapshot() { return JSON.stringify({ nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings }); }
 function restore(snap) {
   const o = JSON.parse(snap);
   state.nodes = o.nodes;
   state.items = o.items;
+  state.dismissed = o.dismissed || {};
+  state.settings = o.settings || state.settings;
   normalize(state);
   ui.selected.clear();
   commit();
@@ -337,7 +367,7 @@ function addNode(fields) {
   const id = uid();
   state.nodes[id] = Object.assign({
     id, kind: 'storage', name: 'Unnamed', emoji: '', access: 'normal', parent: LIMBO,
-    order: nextOrder(), plan: null, mobile: false, isGroup: false,
+    order: nextOrder(), plan: null, mobile: false, isGroup: false, homeTags: [],
   }, fields);
   return id;
 }
@@ -458,11 +488,313 @@ function deleteItems(ids) {
 }
 
 /* ============================================================
+   Suggestions
+   Everything here only proposes. Accepting creates planned moves.
+   ============================================================ */
+const FREQ_RANK = { daily: 0, weekly: 1, monthly: 2, occasionally: 3, rarely: 4, emergency: 5 };
+
+const isGroupNode = (n) => !!n && (n.kind === 'group' || n.isGroup);
+function groupOf(it) { const p = state.nodes[it.parent]; return isGroupNode(p) ? p : null; }
+
+/* Accessibility of the storage holding something: nearest prime/awkward container wins. */
+function storageAccess(nodeId) {
+  let n = state.nodes[nodeId];
+  const seen = new Set();
+  while (n && n.kind !== 'room' && !seen.has(n.id)) {
+    seen.add(n.id);
+    if (n.kind !== 'group' && n.access !== 'normal') return n.access;
+    n = state.nodes[n.parent];
+  }
+  return 'normal';
+}
+
+/* ----- Seasons ----- */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function currentMonth() {
+  const d = window.__stowedNow ? new Date(window.__stowedNow) : new Date();
+  return d.getMonth() + 1;
+}
+function inSeason(se, m = currentMonth()) {
+  return se.start <= se.end ? m >= se.start && m <= se.end : m >= se.start || m <= se.end;
+}
+function seasonLength(se) { return se.start <= se.end ? se.end - se.start + 1 : 12 - se.start + 1 + se.end; }
+function seasonText(se) { return se.start === se.end ? MONTHS[se.start - 1] : `${MONTHS[se.start - 1]}–${MONTHS[se.end - 1]}`; }
+/* Out of season, and the off-season is long enough (Settings) to count as rarely used.
+   It stays that way until the start month arrives; nothing comes back early. */
+function isOffSeason(it) {
+  return !!it.season && !inSeason(it.season) && 12 - seasonLength(it.season) >= state.settings.seasonGap;
+}
+/* Frequency the suggestions use: an off-season item counts as rarely used. */
+function effFreq(it) {
+  if (!it.freq) return null;
+  return isOffSeason(it) ? 'rarely' : it.freq;
+}
+
+/* ----- Suggestion settings (Settings › Suggestions) ----- */
+const SETTING_DEFAULTS = {
+  primeRoomMin: 'weekly',      // in a prime room, keep things used at least this often
+  primeStorageMin: 'monthly',  // in prime storage in a normal room, keep things used at least this often
+  awkwardUpAt: 'weekly',       // in an awkward room or spot, suggest moving up things used at least this often
+  seasonGap: 3,                // months out of season before a seasonal item counts as rarely used
+  createMin: 2,                // items needed to suggest a new group
+  oddOneOutMin: 3,             // group size before "doesn't fit its group" is suggested
+  backupDays: 7,               // days before the backup reminder
+};
+const LEVEL_OPTIONS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['occasionally', 'Occasionally'], ['off', 'Off']];
+
+/* Does an item of this frequency suit this spot? null = fine. */
+function thresholdFor(freq, nodeId, label) {
+  if (!freq || freq === 'emergency' || !state.nodes[nodeId]) return null;
+  const room = roomOf(nodeId);
+  if (!room || room.id === LIMBO) return null;
+  const S = state.settings;
+  const st = storageAccess(nodeId);
+  const r = FREQ_RANK[freq];
+  const used = label || `Used ${FREQ_LABEL[freq].toLowerCase()}`;
+  if (room.access === 'prime' && S.primeRoomMin !== 'off' && r > FREQ_RANK[S.primeRoomMin]) return { kind: 'out', reason: `${used}, but in a prime room` };
+  if (room.access === 'normal' && st === 'prime' && S.primeStorageMin !== 'off' && r > FREQ_RANK[S.primeStorageMin]) return { kind: 'out', reason: `${used}, but in prime storage` };
+  if ((room.access === 'awkward' || st === 'awkward') && S.awkwardUpAt !== 'off' && r <= FREQ_RANK[S.awkwardUpAt]) {
+    return { kind: 'up', reason: `${used}, but in an awkward ${room.access === 'awkward' ? 'room' : 'spot'}` };
+  }
+  return null;
+}
+function itemThreshold(it, nodeId) {
+  const off = isOffSeason(it);
+  return thresholdFor(effFreq(it), nodeId, off ? `Out of season (${seasonText(it.season)}) until ${MONTHS[it.season.start - 1]}` : null);
+}
+
+/* A group's profile, worked out from its members. */
+function groupProfile(g) {
+  const members = itemsIn(g.id);
+  const n = members.length;
+  if (!n) return null;
+  const fc = {};
+  for (const m of members) { const f = effFreq(m); if (f && f !== 'emergency') fc[f] = (fc[f] || 0) + 1; }
+  const freq = Object.keys(fc).sort((a, b) => fc[b] - fc[a] || FREQ_RANK[a] - FREQ_RANK[b])[0]
+    || (members.some((m) => effFreq(m) === 'emergency') ? 'emergency' : null);
+  const tc = {};
+  for (const m of members) for (const t of m.tags) tc[t] = (tc[t] || 0) + 1;
+  const need = Math.max(2, Math.ceil(n / 2));
+  const tags = Object.keys(tc).filter((t) => tc[t] >= need);
+  const withUsage = members.filter((m) => m.usage.length);
+  let usage = [];
+  if (withUsage.length * 2 > n) {
+    const uc = {};
+    for (const m of withUsage) for (const u of m.usage) uc[u] = (uc[u] || 0) + 1;
+    usage = Object.keys(uc).filter((u) => uc[u] * 2 >= withUsage.length);
+  }
+  return { freq, tags, usage, size: n };
+}
+
+/* Emergency items go with anything sharing their tags, whatever its frequency. */
+function freqCompatible(a, b) {
+  return !!a && !!b && (a === b || a === 'emergency' || b === 'emergency');
+}
+
+function sigItems(list) {
+  return list.map((i) => `${i.id}:${effFreq(i) || ''}:${i.season ? `${i.season.start}-${i.season.end}` : ''}:${i.tags.join(',')}:${i.usage.join(',')}`).sort().join('|');
+}
+function placeName(id) { const n = state.nodes[id]; return n ? n.name : ''; }
+
+function computeSuggestions() {
+  const out = [];
+  const handled = new Set();
+  const groups = Object.values(state.nodes).filter((n) => isGroupNode(n) && !n.plan && n.id !== LIMBO);
+  const profiles = new Map(groups.map((g) => [g.id, groupProfile(g)]));
+
+  const dis = state.dismissed;
+  const isDis = (key, sig) => dis[key] === sig;
+  const itemMuted = (it) => isDis(`mute:${it.id}`, sigItems([it]));
+  const groupMuted = (g) => isDis(`mute:${g.id}`, sigItems(itemsIn(g.id)));
+  const itemKey = (sub, it, dest) => `${sub}:${it.id}>${dest || '-'}`;
+
+  /* Matching groups for an item, best first, skipping destinations you've dismissed. */
+  const joinFor = (it, sub, excludeId) => {
+    if (!effFreq(it) || !it.tags.length) return null;
+    const sig = sigItems([it]);
+    const cands = [];
+    for (const g of groups) {
+      if (g.id === excludeId || g.id === it.parent) continue;
+      const p = profiles.get(g.id);
+      if (!p || !freqCompatible(p.freq, effFreq(it)) || !p.tags.length || !usageCompatible(p.usage, it.usage)) continue;
+      const shared = it.tags.filter((t) => p.tags.includes(t)).length;
+      if (!shared || itemThreshold(it, g.id)) continue;
+      cands.push({ group: g, score: shared + (p.usage.length && it.usage.some((u) => p.usage.includes(u)) ? 0.5 : 0) + p.size / 1000 });
+    }
+    cands.sort((a, b) => b.score - a.score);
+    const pick = cands.find((c) => !isDis(itemKey(sub, it, c.group.id), sig));
+    return pick ? pick.group : null;
+  };
+  const pushItem = (sub, it, dest, reason) => {
+    const sig = sigItems([it]);
+    const key = itemKey(sub, it, dest && dest.id);
+    if (isDis(key, sig)) return false;
+    out.push({ key, type: 'item', sub, sig, item: it.id, dest: dest ? dest.id : null, title: it.name, reason });
+    return true;
+  };
+
+  // 1. Groups: split, move whole group, remove odd ones out
+  for (const g of groups) {
+    const members = itemsIn(g.id).filter((i) => !i.plan);
+    if (!members.length) continue;
+    const muted = groupMuted(g);
+    const flags = members.map((i) => [i, itemThreshold(i, g.id)]);
+    const flagged = flags.filter(([, t]) => t);
+    if (flagged.length) {
+      const kinds = new Set(flagged.map(([, t]) => t.kind));
+      if (kinds.size === 1) {
+        const kind = [...kinds][0];
+        const meets = flags.filter(([i, t]) => !t && effFreq(i));
+        const flaggedIds = flagged.map(([i]) => i.id);
+        if (muted) { /* you asked for no suggestions about this group */ }
+        else if (meets.length) {
+          out.push({
+            key: `split:${g.id}`, type: 'split', sig: sigItems(members), group: g.id, kind, flagged: flaggedIds,
+            title: g.name, reason: `${flagged.length} of ${members.length} items ${kind === 'out' ? 'are used too rarely for this spot' : 'are used too often for this awkward spot'}`,
+          });
+        } else {
+          out.push({
+            key: `gmove:${g.id}`, type: 'gmove', sig: sigItems(members), node: g.id, kind,
+            title: g.name, reason: kind === 'out' ? 'Everything in it is used too rarely for this prime spot' : 'Everything in it is used too often for this awkward spot',
+          });
+        }
+        flaggedIds.forEach((id) => handled.add(id));
+      }
+    }
+    if (members.length >= state.settings.oddOneOutMin) {
+      for (const it of members) {
+        if (handled.has(it.id) || itemMuted(it)) continue;
+        const others = members.filter((o) => o !== it);
+        const sharesTag = others.some((o) => o.tags.some((t) => it.tags.includes(t)));
+        const sharesUse = others.some((o) => usageCompatible(o.usage, it.usage));
+        if (sharesTag || sharesUse) continue;
+        pushItem('remove', it, joinFor(it, 'remove', g.id), `Shares no tags or rooms with the rest of “${g.name}”`);
+        handled.add(it.id);
+      }
+    }
+  }
+
+  // 2. Tag homes you've set (a dismissed home falls through to the next one, then to normal matching)
+  const homes = Object.values(state.nodes).filter((n) => n.homeTags && n.homeTags.length && n.id !== LIMBO);
+  if (homes.length) {
+    for (const it of Object.values(state.items)) {
+      if (it.plan || handled.has(it.id) || itemMuted(it)) continue;
+      for (const h of homes) {
+        const tag = it.tags.find((t) => h.homeTags.includes(t));
+        if (!tag || isWithin(it.parent, h.id) || itemThreshold(it, h.id)) continue;
+        if (pushItem('home', it, h, `“${h.name}” is the home for #${tag}`)) { handled.add(it.id); break; }
+      }
+    }
+  }
+
+  // 3. Loose items: threshold, then joining a matching group
+  const loose = Object.values(state.items).filter((i) => !i.plan && !groupOf(i) && !handled.has(i.id) && !itemMuted(i));
+  for (const it of loose) {
+    const t = itemThreshold(it, it.parent);
+    if (t) {
+      if (pushItem(t.kind, it, joinFor(it, t.kind), t.reason)) handled.add(it.id);
+    } else {
+      const join = joinFor(it, 'join');
+      if (join && pushItem('join', it, join, `Matches group “${join.name}”`)) handled.add(it.id);
+    }
+  }
+
+  // 4. New groups: 2+ loose items sharing frequency (emergency matches any), a tag and a room, spread over 2+ places
+  const tagRoom = new Map();
+  const noDest = new Set(out.filter((x) => x.type === 'item' && !x.dest).map((x) => x.item));
+  for (const it of loose) {
+    if (handled.has(it.id) && !noDest.has(it.id)) continue;
+    if (!effFreq(it) || !it.tags.length) continue;
+    const rooms = it.usage.length ? it.usage : ['*'];
+    for (const tag of it.tags) {
+      for (const r of rooms) {
+        const k = `${tag}|${r}`;
+        if (!tagRoom.has(k)) tagRoom.set(k, { tag, room: r, items: [] });
+        tagRoom.get(k).items.push(it);
+      }
+    }
+  }
+  const buckets = [];
+  for (const tr of tagRoom.values()) {
+    const emerg = tr.items.filter((i) => effFreq(i) === 'emergency');
+    const freqs = [...new Set(tr.items.map((i) => effFreq(i)).filter((f) => f !== 'emergency'))];
+    if (!freqs.length) buckets.push({ ...tr, freq: 'emergency', mixed: false });
+    for (const f of freqs) {
+      const its = tr.items.filter((i) => effFreq(i) === f);
+      buckets.push({ ...tr, freq: f, mixed: emerg.length > 0, items: [...its, ...emerg] });
+    }
+  }
+  const cands = buckets
+    .filter((b) => b.items.length >= Math.max(2, state.settings.createMin) && new Set(b.items.map((i) => i.parent)).size >= 2)
+    .sort((a, b) => b.items.length - a.items.length);
+  const kept = [];
+  for (const b of cands) {
+    const ids = new Set(b.items.map((i) => i.id));
+    if (kept.some((k) => [...ids].every((id) => k.ids.has(id)))) continue;
+    kept.push({ ...b, ids });
+  }
+  for (const b of kept) {
+    const counts = {};
+    for (const i of b.items) counts[i.parent] = (counts[i.parent] || 0) + 1;
+    const place = Object.keys(counts).sort((x, y) => counts[y] - counts[x])
+      .find((p) => p !== LIMBO && !thresholdFor(b.freq, p)) || null;
+    const ids = [...b.ids].sort();
+    const roomName = b.room !== '*' && state.nodes[b.room] ? ` used in ${state.nodes[b.room].name}` : '';
+    out.push({
+      key: `create:${ids.join(',')}`, type: 'create', sig: sigItems(b.items), items: ids, place,
+      name: b.tag.charAt(0).toUpperCase() + b.tag.slice(1),
+      title: `New group: #${b.tag}`,
+      reason: `${b.items.length} ${b.mixed ? `${FREQ_LABEL[b.freq].toLowerCase()} and emergency` : FREQ_LABEL[b.freq].toLowerCase()} items tagged #${b.tag}${roomName}, in ${Object.keys(counts).length} places`,
+    });
+  }
+
+  // 5. Merge groups with the same profile in different places
+  for (let a = 0; a < groups.length; a++) {
+    for (let c = a + 1; c < groups.length; c++) {
+      const g1 = groups[a], g2 = groups[c];
+      if (groupMuted(g1) || groupMuted(g2)) continue;
+      const p1 = profiles.get(g1.id), p2 = profiles.get(g2.id);
+      if (!p1 || !p2 || !freqCompatible(p1.freq, p2.freq) || !usageCompatible(p1.usage, p2.usage)) continue;
+      const shared = p1.tags.filter((t) => p2.tags.includes(t));
+      if (!shared.length || g1.parent === g2.parent || isWithin(g1.id, g2.id) || isWithin(g2.id, g1.id)) continue;
+      const [big, small] = p1.size >= p2.size ? [g1, g2] : [g2, g1];
+      const moving = itemsIn(small.id).filter((i) => !i.plan);
+      if (!moving.length || moving.some((i) => itemThreshold(i, big.id))) continue;
+      out.push({
+        key: `merge:${[g1.id, g2.id].sort().join(',')}`, type: 'merge', sig: sigItems([...itemsIn(g1.id), ...itemsIn(g2.id)]),
+        items: moving.map((i) => i.id), dest: big.id, from: small.id,
+        title: `Merge “${small.name}” into “${big.name}”`, reason: p1.freq === p2.freq ? `Both are ${FREQ_LABEL[p1.freq].toLowerCase()} #${shared.join(', #')}` : `Both are #${shared.join(', #')}`,
+      });
+    }
+  }
+
+  const order = { split: 0, gmove: 1, item: 2, create: 3, merge: 4 };
+  const subOrder = { out: 0, up: 0, home: 1, remove: 2, join: 3 };
+  return out
+    .filter((s) => state.dismissed[s.key] !== s.sig)
+    .sort((x, y) => order[x.type] - order[y.type] || (subOrder[x.sub] || 0) - (subOrder[y.sub] || 0) || x.title.localeCompare(y.title));
+}
+
+function suggestionMarks(sugs) {
+  const m = {};
+  for (const s of sugs) {
+    if (s.type === 'item' && (s.sub === 'out' || s.sub === 'up')) m[s.item] = s.sub;
+    if (s.type === 'split') for (const id of s.flagged) m[id] = s.kind;
+    if (s.type === 'gmove') for (const i of itemsIn(s.node)) if (effFreq(i) && effFreq(i) !== 'emergency') m[i.id] = s.kind;
+  }
+  return m;
+}
+
+/* ============================================================
    Rendering
    ============================================================ */
+let lastSugs = [];
 function render() {
   RC = buildIndex();
   try {
+    lastSugs = computeSuggestions();
+    RC.sugs = lastSugs;
+    RC.marks = suggestionMarks(lastSugs);
     renderViews();
     renderBanner();
     renderMain();
@@ -486,6 +818,7 @@ function renderViews() {
   const needs = needsInfoCount();
   const views = [
     ['rooms', 'Rooms', 0],
+    ['sugs', 'Suggestions', lastSugs.length],
     ['moves', 'Planned moves', moves],
     ['needs', 'Needs info', needs],
     ['tags', 'Tags', 0],
@@ -498,7 +831,7 @@ function renderBanner() {
   const count = Object.keys(state.items).length;
   const d = daysAgo(state.meta.lastBackup);
   let html = '';
-  if (count && (d === null || d >= 7)) {
+  if (count && (d === null || d >= state.settings.backupDays)) {
     html = `<div class="banner"><span>Last backup: ${d === null ? 'never' : `${d} days ago`}</span>
       <button class="btn small" data-action="backup">Back up</button></div>`;
   }
@@ -508,7 +841,8 @@ function renderBanner() {
 function renderMain() {
   const main = $('#app');
   if (ui.search.trim()) { main.innerHTML = renderSearch(); return; }
-  if (ui.view === 'moves') main.innerHTML = renderMoves();
+  if (ui.view === 'sugs') main.innerHTML = renderSuggestions();
+  else if (ui.view === 'moves') main.innerHTML = renderMoves();
   else if (ui.view === 'needs') main.innerHTML = renderNeeds();
   else if (ui.view === 'tags') main.innerHTML = renderTags();
   else main.innerHTML = renderTree();
@@ -602,7 +936,8 @@ function chipHtml(it) {
   if (it.plan) cls.push('planned-out');
   if (it.freq === 'emergency') cls.push('emergency');
   if (ui.selected.has(it.id)) cls.push('selected');
-  return `<button class="${cls.join(' ')}" data-item="${it.id}" data-drag-item="${it.id}">${esc(it.name)}${it.qty > 1 ? `<span class="qty">×${it.qty}</span>` : ''}</button>`;
+  const mark = RC && RC.marks ? RC.marks[it.id] : null;
+  return `<button class="${cls.join(' ')}" data-item="${it.id}" data-drag-item="${it.id}">${esc(it.name)}${it.qty > 1 ? `<span class="qty">×${it.qty}</span>` : ''}${mark ? `<span class="mark" title="${mark === 'out' ? 'Suggested to move somewhere less prime' : 'Suggested to move somewhere easier to reach'}">${mark === 'out' ? '↓' : '↑'}</span>` : ''}</button>`;
 }
 
 function ghostChipHtml(it) {
@@ -672,7 +1007,7 @@ function renderMoves() {
 
 function renderNeeds() {
   const its = Object.values(state.items).filter((i) => needsInfo(i).length);
-  if (!its.length) return `<div class="empty">Every item has tags, usage locations and frequency.</div>`;
+  if (!its.length) return `<div class="empty">Every item has tags and a frequency.</div>`;
   const byRoom = new Map();
   for (const it of its) {
     const r = roomOf(it.parent);
@@ -700,6 +1035,267 @@ function renderTags() {
   return h;
 }
 
+/* Which container a suggestion is about, so suggestions can be stacked per container. */
+function sugStackId(s) {
+  if (s.type === 'item') return state.items[s.item].parent;
+  if (s.type === 'split') return state.nodes[s.group].parent;
+  if (s.type === 'gmove') return state.nodes[s.node].parent;
+  if (s.type === 'merge') return state.nodes[s.from].parent;
+  return '__new';
+}
+
+/* Is this suggestion about something inside the chosen room/container, or about the chosen item? */
+function sugInScope(s, scope) {
+  if (!scope) return true;
+  if (scope.kind === 'item') {
+    const id = scope.id;
+    if (s.type === 'item') return s.item === id;
+    if (s.type === 'create' || s.type === 'merge') return s.items.includes(id);
+    const g = s.group || s.node;
+    return !!state.items[id] && state.items[id].parent === g;
+  }
+  const inside = (nodeId) => !!nodeId && isWithin(nodeId, scope.id);
+  if (s.type === 'item') return inside(state.items[s.item].parent);
+  if (s.type === 'split') return inside(s.group);
+  if (s.type === 'gmove') return inside(s.node);
+  if (s.type === 'merge') return inside(s.from) || inside(s.dest);
+  return s.items.some((id) => inside(state.items[id].parent));
+}
+function scopeLabel(scope) {
+  if (!scope) return 'Whole house';
+  if (scope.kind === 'item') return state.items[scope.id] ? state.items[scope.id].name : 'Whole house';
+  return state.nodes[scope.id] ? pathText(scope.id) : 'Whole house';
+}
+function showSuggestionsFor(scope) {
+  ui.sugScope = scope;
+  ui.view = 'sugs';
+  ui.search = '';
+  $('#search').value = '';
+  closeSheet();
+  saveUi();
+  render();
+  window.scrollTo(0, 0);
+}
+
+function renderSuggestions() {
+  const sc = ui.sugScope;
+  if (sc && !(sc.kind === 'item' ? state.items[sc.id] : state.nodes[sc.id])) ui.sugScope = null;
+  const sugs = lastSugs.filter((s) => sugInScope(s, ui.sugScope));
+  const noFreq = Object.values(state.items).filter((i) => !i.freq).length;
+  const dismissed = Object.keys(state.dismissed).length;
+  let h = `<div class="scope-bar"><span class="label">For</span>
+      <button class="btn small scope-btn" data-action="sug-scope">${esc(scopeLabel(ui.sugScope))} ▾</button>
+      ${ui.sugScope ? '<button class="btn small" data-action="sug-scope-all">Whole house</button>' : ''}</div>
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+    <span class="note">${sugs.length} suggestion${sugs.length === 1 ? '' : 's'}${dismissed ? ` · ${dismissed} dismissed` : ''}</span>
+    <button class="btn small" data-action="reset-sugs">Reset suggestions</button></div>`;
+  if (noFreq) h += `<div class="note" style="margin-bottom:8px">${noFreq} item${noFreq === 1 ? ' has' : 's have'} no frequency set and ${noFreq === 1 ? 'isn’t' : 'aren’t'} considered. <button class="btn small" data-view="needs">Needs info</button></div>`;
+  if (!sugs.length) return h + `<div class="empty">No suggestions ${ui.sugScope ? 'for this' : 'right now'}.</div>`;
+  const stacks = new Map();
+  lastSugs.forEach((s, idx) => {
+    if (!sugInScope(s, ui.sugScope)) return;
+    const k = sugStackId(s);
+    if (!stacks.has(k)) stacks.set(k, []);
+    stacks.get(k).push([s, idx]);
+  });
+  const roomRank = (id) => { const r = roomOf(id); return r ? r.order : 0; };
+  const keys = [...stacks.keys()].sort((a, b) => {
+    if (a === '__new') return 1;
+    if (b === '__new') return -1;
+    return roomRank(a) - roomRank(b) || pathText(a).localeCompare(pathText(b));
+  });
+  for (const k of keys) {
+    const list = stacks.get(k);
+    const room = k === '__new' ? null : roomOf(k);
+    const head = k === '__new' ? 'New groups' : `${esc(nodeEmoji(room))} ${esc(pathText(k))}`;
+    h += `<section class="sug-stack" style="--edge:var(--${(room && room.color) || 'grey'}-e)">
+      <div class="sug-stack-head">${head}<span class="note"> · ${list.length}</span></div>
+      ${list.map(([s, idx]) => suggestionCard(s, idx)).join('')}</section>`;
+  }
+  return h;
+}
+
+function sugLabel(s) {
+  if (s.type === 'split') return 'Split group';
+  if (s.type === 'gmove') return s.kind === 'out' ? 'Move group out of prime' : 'Move group somewhere easier';
+  if (s.type === 'create') return 'Create group';
+  if (s.type === 'merge') return 'Merge groups';
+  return { out: 'Move out of prime', up: 'Move somewhere easier', home: 'Tag home', remove: 'Doesn’t fit its group', join: 'Join group' }[s.sub];
+}
+
+function suggestionCard(s, idx) {
+  const btn = (act, label, primary) => `<button class="btn small${primary ? ' primary' : ''}" data-sact="${act}" data-sug="${idx}">${label}</button>`;
+  let body = '';
+  let actions = '';
+  if (s.type === 'item') {
+    const it = state.items[s.item];
+    body = `<div class="title">${esc(it.name)}${it.qty > 1 ? ` <span class="path">×${it.qty}</span>` : ''}</div>
+      <div class="sug-reason">${esc(s.reason)}</div>
+      ${s.dest ? `<div class="sug-dest">→ ${esc(pathText(s.dest))}</div>` : '<div class="path">No matching group or home left to suggest.</div>'}`;
+    actions = (s.dest ? btn('propose', 'Propose move', true) + btn('choose', 'Elsewhere…') : btn('choose', 'Choose where…', true))
+      + btn('dismiss', 'Dismiss') + btn('mute', 'Dismiss all for this item');
+  } else if (s.type === 'gmove') {
+    const g = state.nodes[s.node];
+    body = `<div class="title">${esc(nodeEmoji(g))} ${esc(g.name)}</div><div class="sug-reason">${esc(s.reason)}</div>`;
+    actions = btn('choose', 'Choose where…', true) + btn('dismiss', 'Dismiss') + btn('mute', 'Dismiss all for this group');
+  } else if (s.type === 'split') {
+    const g = state.nodes[s.group];
+    body = `<div class="title">${esc(nodeEmoji(g))} ${esc(g.name)}</div><div class="sug-reason">${esc(s.reason)}</div>`;
+    actions = btn('split', 'Review split', true) + btn('dismiss', 'Dismiss') + btn('mute', 'Dismiss all for this group');
+  } else if (s.type === 'create') {
+    const its = s.items.map((id) => state.items[id]);
+    body = `<div class="title">${esc(s.title)}</div><div class="sug-reason">${esc(s.reason)}</div>
+      <div class="chips" style="padding:4px 0">${its.map((i) => `<span class="chip static">${esc(i.name)}</span>`).join('')}</div>
+      <div class="sug-dest">${s.place ? `In ${esc(pathText(s.place))}` : 'Choose where it goes'}</div>`;
+    actions = btn('create', 'Create group…', true) + btn('dismiss', 'Dismiss');
+  } else if (s.type === 'merge') {
+    body = `<div class="title">${esc(s.title)}</div><div class="sug-reason">${esc(s.reason)}</div>
+      <div class="sug-dest">→ ${esc(pathText(s.dest))}</div>`;
+    actions = btn('propose', 'Propose merge', true) + btn('dismiss', 'Dismiss');
+  }
+  return `<div class="sug-row"><div class="sug-type">${esc(sugLabel(s))}</div>${body}<div class="row sug-actions">${actions}</div></div>`;
+}
+
+function handleSuggestion(act, s) {
+  if (!s) return;
+  if (act === 'dismiss') {
+    const snap = snapshot();
+    state.dismissed[s.key] = s.sig;
+    commit();
+    const next = s.type === 'item' ? lastSugs.find((x) => x.item === s.item) : null;
+    toast(next && next.dest ? 'Dismissed. Showing the next option.' : 'Dismissed', snap);
+  } else if (act === 'mute') {
+    const snap = snapshot();
+    if (s.type === 'item') state.dismissed[`mute:${s.item}`] = sigItems([state.items[s.item]]);
+    else { const gid = s.group || s.node; state.dismissed[`mute:${gid}`] = sigItems(itemsIn(gid)); }
+    commit();
+    toast('No more suggestions for it until its details change', snap);
+  } else if (act === 'propose') {
+    if (s.type === 'item') applyMove({ items: [s.item] }, s.dest, 'plan');
+    else if (s.type === 'merge') applyMove({ items: s.items }, s.dest, 'plan');
+  } else if (act === 'choose') {
+    if (s.type === 'item') openPicker({ items: [s.item] });
+    else if (s.type === 'gmove') openPicker({ nodes: [s.node] });
+  } else if (act === 'create') openCreateGroupSheet(s, { name: s.name, place: s.place });
+  else if (act === 'split') openSplitSheet(s);
+}
+
+function openCreateGroupSheet(s, draft) {
+  openSheet({
+    focus: '#f-gname',
+    html: () => {
+      const local = draft.place ? s.items.filter((id) => state.items[id].parent === draft.place).length : 0;
+      return `<h2>Create group</h2>
+      <div class="field"><label for="f-gname">Name</label><input id="f-gname" type="text" value="${esc(draft.name)}"></div>
+      <div class="field"><span class="label">Where</span><div class="row"><span class="grow">${draft.place ? esc(pathText(draft.place)) : '<span class="note">Not chosen</span>'}</span>
+        <button class="btn small" data-act="place">Change…</button></div></div>
+      <div class="note">${draft.place ? `${local} item${local === 1 ? ' is' : 's are'} already there and join straight away. The other ${s.items.length - local} get planned moves into the group.` : ''}</div>
+      <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" data-act="make" ${draft.place ? '' : 'disabled'}>Create</button></div>`;
+    },
+    input(e) { if (e.target.id === 'f-gname') draft.name = e.target.value; },
+    click(e) {
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      if (b.dataset.act === 'place') {
+        openPicker({ items: s.items }, {
+          title: 'Where should the group go?', noGroups: true,
+          choose: (sel) => { draft.place = sel; openCreateGroupSheet(s, draft); },
+        });
+        return;
+      }
+      if (b.dataset.act !== 'make' || !draft.place) return;
+      const snap = snapshot();
+      const name = draft.name.trim() || 'New group';
+      const gid = addNode({ kind: 'group', name, parent: draft.place });
+      for (const id of s.items) {
+        const it = state.items[id];
+        if (!it) continue;
+        if (it.parent === draft.place) { it.parent = gid; it.plan = null; } else it.plan = gid;
+      }
+      for (const p of pathNodes(gid)) ui.expanded[p.id] = true;
+      saveUi();
+      closeSheet();
+      commit();
+      toast(`Created group “${name}”`, snap);
+    },
+  });
+}
+
+function openSplitSheet(s) {
+  const g = state.nodes[s.group];
+  if (!g) return;
+  const physical = g.kind !== 'group';
+  const members = itemsIn(g.id).filter((i) => !i.plan);
+  const side = {};
+  members.forEach((i) => { side[i.id] = s.flagged.includes(i.id) ? 'b' : 'a'; });
+  let pouchSide = 'a';
+  // Side a meets this spot's threshold and stays; side b should move.
+  const moreSide = s.kind === 'out' ? 'a' : 'b';
+  const names = physical
+    ? { a: `${g.name} group`, b: `${g.name} group` }
+    : { a: `${g.name} – ${moreSide === 'a' ? 'more' : 'less'} frequent`, b: `${g.name} – ${moreSide === 'b' ? 'more' : 'less'} frequent` };
+  const readNames = () => {
+    for (const k of ['a', 'b']) { const f = $(`#f-split-${k}`, sheetBody); if (f) names[k] = f.value; }
+  };
+  const chip = (i) => `<button class="chip" data-split-drag="${i.id}">${esc(i.name)}${i.qty > 1 ? `<span class="qty">×${i.qty}</span>` : ''}${i.freq ? `<span class="qty"> · ${esc(isOffSeason(i) ? 'out of season' : FREQ_LABEL[i.freq].toLowerCase())}</span>` : ''}</button>`;
+  const column = (k) => {
+    const its = members.filter((i) => side[i.id] === k);
+    const hasPouch = physical && pouchSide === k;
+    const head = k === 'a' ? 'Stays here' : s.kind === 'out' ? 'Moves somewhere less prime' : 'Moves somewhere easier';
+    const nameField = hasPouch
+      ? `<button class="chip pouch" data-split-drag="__pouch">${esc(nodeEmoji(g))} ${esc(g.name)}</button>`
+      : `<input id="f-split-${k}" type="text" value="${esc(names[k])}" aria-label="Group name">`;
+    return `<div class="split-side" data-split-side="${k}"><div class="split-head">${head}</div>${nameField}
+      <div class="chips" style="padding:6px 0 0">${its.map(chip).join('') || '<span class="note">Empty</span>'}</div></div>`;
+  };
+  openSheet({
+    split: true,
+    html: () => `<h2>Split “${esc(g.name)}”</h2><div class="sub">${esc(s.reason)}. Tap or drag items to switch sides.${physical ? ' Drag the container to choose which side keeps it.' : ''}</div>
+      <div class="split">${column('a')}${column('b')}</div>
+      <div class="note" style="margin-top:8px">A side left with one item becomes a loose item rather than a group.</div>
+      <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" data-act="split">Split</button></div>`,
+    splitDrop(id, k) {
+      readNames();
+      if (id === '__pouch') pouchSide = k; else if (side[id]) side[id] = k;
+      drawSheet();
+    },
+    click(e) {
+      if (Date.now() < suppressClickUntil) return;
+      const c = e.target.closest('[data-split-drag]');
+      if (c) {
+        readNames();
+        const id = c.dataset.splitDrag;
+        if (id === '__pouch') pouchSide = pouchSide === 'a' ? 'b' : 'a';
+        else side[id] = side[id] === 'a' ? 'b' : 'a';
+        drawSheet();
+        return;
+      }
+      if (!e.target.closest('[data-act="split"]')) return;
+      readNames();
+      const snap = snapshot();
+      const moveOut = (its, name) => {
+        if (its.length >= 2) {
+          const gid = addNode({ kind: 'group', name: name.trim() || `${g.name} group`, parent: g.parent });
+          its.forEach((i) => { i.parent = gid; });
+          ui.expanded[gid] = true;
+        } else its.forEach((i) => { i.parent = g.parent; });
+      };
+      if (physical) {
+        const other = pouchSide === 'a' ? 'b' : 'a';
+        moveOut(members.filter((i) => side[i.id] === other), names[other]);
+      } else {
+        if (names.a.trim()) g.name = names.a.trim();
+        moveOut(members.filter((i) => side[i.id] === 'b'), names.b);
+        dissolveCheck([g.id]);
+      }
+      saveUi();
+      closeSheet();
+      commit();
+      toast('Group split', snap);
+    },
+  });
+}
+
 function renderSelectBar() {
   const bar = $('#selectbar');
   if (!ui.select) { bar.classList.add('hidden'); return; }
@@ -723,6 +1319,7 @@ let sheetCtl = null;
 function openSheet(ctl) {
   if (sheetCtl && sheetCtl.onClose) sheetCtl.onClose();
   sheetCtl = ctl;
+  $('#toast').classList.add('hidden');
   sheetRoot.classList.remove('hidden');
   $('.sheet', sheetRoot).scrollTop = 0;
   drawSheet();
@@ -767,6 +1364,21 @@ function confirmSheet({ title, text, ok = 'OK', danger = false, onOk, extra = []
 function segHtml(attr, options, current) {
   return `<div class="seg">${options.map(([v, l]) => `<button type="button" data-${attr}="${v}" class="${(Array.isArray(current) ? current.includes(v) : current === v) ? 'on' : ''}">${esc(l)}</button>`).join('')}</div>`;
 }
+function monthSelect(id, value) {
+  return `<select id="${id}" class="month-select">${MONTHS.map((m, i) => `<option value="${i + 1}" ${value === i + 1 ? 'selected' : ''}>${m}</option>`).join('')}</select>`;
+}
+function defaultSeason() { const m = currentMonth(); return { start: m, end: ((m + 1) % 12) + 1 }; }
+function seasonStatus(it) {
+  if (!it.season) return '';
+  if (inSeason(it.season)) return 'In season now, so its usual frequency applies.';
+  if (isOffSeason(it)) return `Out of season now: counts as rarely used until ${MONTHS[it.season.start - 1]}.`;
+  return `Out of season now, but for less than ${state.settings.seasonGap} months, so its usual frequency still applies.`;
+}
+function readSeason(root) {
+  const a = $('#f-sstart', root), b = $('#f-send', root);
+  return a && b ? validSeason({ start: a.value, end: b.value }) : null;
+}
+
 function usageOptions() { return rooms(false).map((r) => [r.id, `${nodeEmoji(r)} ${r.name}`]); }
 function tagSuggestHtml(current) {
   const sug = allTags().filter(([t]) => !current.includes(t)).slice(0, 16);
@@ -796,11 +1408,15 @@ function openItemSheet(id) {
       <div class="field"><label for="f-name">Name</label><input id="f-name" type="text" value="${esc(it.name)}"></div>
       <div class="field"><label for="f-qty">Quantity</label><input id="f-qty" type="number" min="1" inputmode="numeric" value="${it.qty}" style="max-width:110px"></div>
       <div class="field"><label for="f-tags">Tags (comma separated)</label><input id="f-tags" type="text" value="${esc(it.tags.join(', '))}" autocapitalize="none">${tagSuggestHtml(it.tags)}</div>
-      <div class="field"><span class="label">Used in</span>${usage.length ? segHtml('usage', usage, it.usage) : '<div class="note">Add rooms first.</div>'}</div>
-      <div class="field"><span class="label">How often it’s used</span>${segHtml('freq', FREQS, it.freq)}</div>
+      <div class="field"><span class="label">${USED_IN_LABEL}</span>${usage.length ? segHtml('usage', usage, it.usage) : '<div class="note">Add rooms first.</div>'}</div>
+      <div class="field"><span class="label">How often it’s used</span>${segHtml('freq', FREQS, it.freq)}
+        <label class="check"><input type="checkbox" id="f-seasonal" ${it.season ? 'checked' : ''}> Seasonal</label>
+        ${it.season ? `<div class="row">In use from ${monthSelect('f-sstart', it.season.start)} to ${monthSelect('f-send', it.season.end)}</div>
+        <div class="note" style="margin-top:4px">${esc(seasonStatus(it))}</div>` : ''}</div>
       <div class="field"><span class="label">Location</span>
         <div class="row"><span class="grow">${esc(pathText(it.parent))}</span>
         <button class="btn small" data-act="relocate">Move…</button><button class="btn small" data-act="show">Show</button></div></div>
+      <div class="field"><button class="btn small" data-act="sugs">Suggestions for this item</button></div>
       ${it.plan ? `<div class="field"><span class="label">Planned move</span>
         <div>→ ${esc(pathText(it.plan))}</div>
         <div class="row" style="margin-top:6px"><button class="btn small" data-act="plan-cancel">Cancel plan</button>
@@ -808,7 +1424,11 @@ function openItemSheet(id) {
       <div class="actions spread"><button class="btn danger" data-act="delete">Delete</button><button class="btn primary" data-close>Done</button></div>`;
     },
     onClose: commitFields,
-    change(e) { if (e.target.matches('#f-name,#f-qty,#f-tags')) { commitFields(); } },
+    change(e) {
+      if (e.target.matches('#f-name,#f-qty,#f-tags')) { commitFields(); return; }
+      if (e.target.id === 'f-seasonal') { commitFields(); it.season = e.target.checked ? defaultSeason() : null; commit(); drawSheet(); return; }
+      if (e.target.matches('#f-sstart,#f-send')) { commitFields(); it.season = readSeason(sheetBody); commit(); drawSheet(); }
+    },
     click(e) {
       const b = e.target.closest('[data-usage],[data-freq],[data-addtag],[data-act]');
       if (!b) return;
@@ -827,6 +1447,7 @@ function openItemSheet(id) {
         const act = b.dataset.act;
         if (act === 'relocate') openPicker({ items: [id] });
         else if (act === 'show') { closeSheet(); reveal(it.parent, id); }
+        else if (act === 'sugs') showSuggestionsFor({ kind: 'item', id });
         else if (act === 'plan-ok') { closeSheet(); applyMove({ items: [id] }, it.plan, 'move'); }
         else if (act === 'plan-cancel') { it.plan = null; commit(); drawSheet(); }
         else if (act === 'delete') {
@@ -850,6 +1471,11 @@ function openNodeSheet(id) {
   const commitName = () => {
     const f = $('#f-name', sheetBody);
     if (!isNew && f && f.value.trim() && f.value.trim() !== n.name) { n.name = f.value.trim(); commit(); }
+    const h = $('#f-home', sheetBody);
+    if (!isNew && h) {
+      const t = parseTags(h.value);
+      if (t.join(',') !== (n.homeTags || []).join(',')) { n.homeTags = t; commit(); }
+    }
   };
   const emojiSet = n.kind === 'room' ? ROOM_EMOJI : STORAGE_EMOJI;
   const kindLabel = n.kind === 'room' ? 'Room' : n.kind === 'group' ? 'Group' : (n.parent && state.nodes[n.parent] && state.nodes[n.parent].kind !== 'room' ? 'Sub-container' : 'Storage');
@@ -874,6 +1500,10 @@ function openNodeSheet(id) {
         h += `<div class="field"><span class="label">Type</span>${segHtml('mobile', [['fixed', 'Fixed (shelf, cupboard)'], ['mobile', 'Mobile (box, trug, bag)']], n.mobile ? 'mobile' : 'fixed')}</div>
           <label class="check"><input type="checkbox" id="f-isgroup" ${n.isGroup ? 'checked' : ''}> Treat as a group (everything in it belongs together)</label>`;
       }
+      if (!isNew) {
+        h += `<div class="field"><label for="f-home">Home for tags <span class="note">(items with these tags get suggested to move here)</span></label>
+          <input id="f-home" type="text" value="${esc((n.homeTags || []).join(', '))}" autocapitalize="none" placeholder="e.g. sewing, haberdashery">${tagSuggestHtml(n.homeTags || [])}</div>`;
+      }
       if (!isNew && n.kind !== 'room') {
         h += `<div class="field"><span class="label">Location</span><div class="row"><span class="grow">${esc(pathText(n.parent))}</span>
           <button class="btn small" data-act="relocate">Move…</button></div></div>`;
@@ -882,6 +1512,9 @@ function openNodeSheet(id) {
             <div class="row" style="margin-top:6px"><button class="btn small" data-act="plan-cancel">Cancel plan</button>
             <button class="btn small primary" data-act="plan-ok">Confirm move done</button></div></div>`;
         }
+      }
+      if (!isNew) {
+        h += `<div class="field"><button class="btn small" data-act="sugs">Suggestions for ${n.kind === 'room' ? 'this room' : 'everything in here'}</button></div>`;
       }
       if (!isNew && n.kind === 'room') {
         h += `<div class="field"><span class="label">Order</span><div class="row"><button class="btn small" data-act="up">↑ Earlier</button><button class="btn small" data-act="down">↓ Later</button></div></div>`;
@@ -895,6 +1528,7 @@ function openNodeSheet(id) {
     change(e) {
       if (e.target.id === 'f-name') commitName();
       if (e.target.id === 'f-isgroup') { n.isGroup = e.target.checked; if (!isNew) commit(); }
+      if (e.target.id === 'f-home' && !isNew) { n.homeTags = parseTags(e.target.value); commit(); }
     },
     input(e) {
       if (e.target.id === 'f-emoji') {
@@ -904,12 +1538,13 @@ function openNodeSheet(id) {
       }
     },
     click(e) {
-      const b = e.target.closest('[data-emoji],[data-color],[data-access],[data-mobile],[data-act]');
+      const b = e.target.closest('[data-emoji],[data-color],[data-access],[data-mobile],[data-addtag],[data-act]');
       if (!b) return;
       const nameField = $('#f-name', sheetBody);
       if (isNew && nameField) n.name = nameField.value;
       else commitName();
-      if (b.dataset.emoji) { n.emoji = b.dataset.emoji; }
+      if (b.dataset.addtag) { n.homeTags = parseTags([...(n.homeTags || []), b.dataset.addtag].join(',')); }
+      else if (b.dataset.emoji) { n.emoji = b.dataset.emoji; }
       else if (b.dataset.color) { n.color = b.dataset.color; }
       else if (b.dataset.access) { n.access = b.dataset.access; }
       else if (b.dataset.mobile) { n.mobile = b.dataset.mobile === 'mobile'; }
@@ -923,6 +1558,7 @@ function openNodeSheet(id) {
           closeSheet(); commit(); return;
         }
         if (act === 'relocate') { openPicker({ nodes: [n.id] }); return; }
+        if (act === 'sugs') { showSuggestionsFor({ kind: 'node', id: n.id }); return; }
         if (act === 'plan-ok') { closeSheet(); applyMove({ nodes: [n.id] }, n.plan, 'move'); return; }
         if (act === 'plan-cancel') { n.plan = null; }
         if (act === 'up' || act === 'down') {
@@ -980,7 +1616,7 @@ function openAddSheet(targetId) {
         ${draft.asGroup ? `<div class="field"><input id="f-groupname" type="text" placeholder="Group name, e.g. Storm clothing" value="${esc(draft.groupName)}"></div>` : ''}`}
       ${draft.asContainer ? '' : `<details class="details" ${draft.tags || draft.usage.length || draft.freq ? 'open' : ''}><summary>Details for all of these (optional)</summary>
         <div class="field"><label for="f-tags">Tags (comma separated)</label><input id="f-tags" type="text" value="${esc(draft.tags)}" autocapitalize="none">${tagSuggestHtml(parseTags(draft.tags))}</div>
-        <div class="field"><span class="label">Used in</span>${usageOptions().length ? segHtml('usage', usageOptions(), draft.usage) : '<div class="note">Add rooms first.</div>'}</div>
+        <div class="field"><span class="label">${USED_IN_LABEL}</span>${usageOptions().length ? segHtml('usage', usageOptions(), draft.usage) : '<div class="note">Add rooms first.</div>'}</div>
         <div class="field"><span class="label">How often they’re used</span>${segHtml('freq', FREQS, draft.freq)}</div></details>`}
       <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" data-act="add">Add</button></div>`,
     change(e) {
@@ -1020,15 +1656,17 @@ function openAddSheet(targetId) {
 }
 
 /* ----- location picker ----- */
-function openPicker(payload, onDone) {
+/* opts: onDone() after a move; choose(nodeId) to just pick a place; noGroups; title */
+function openPicker(payload, opts = {}) {
   const itemIds = payload.items || [];
   const nodeIds = payload.nodes || [];
   let sel = null;
   const exp = ui.pickerExpanded;
   const first = state.items[itemIds[0]] || state.nodes[nodeIds[0]];
   if (first) for (const p of pathNodes(first.parent)) exp[p.id] = true;
-  const label = itemIds.length + nodeIds.length === 1 ? `“${first.name}”` : `${itemIds.length + nodeIds.length} things`;
-  const invalid = (tid) => nodeIds.length > 0 && !validTargetForNodes(nodeIds, tid);
+  const label = itemIds.length + nodeIds.length === 1 && first ? `“${first.name}”` : `${itemIds.length + nodeIds.length} things`;
+  const invalid = (tid) => (nodeIds.length > 0 && !validTargetForNodes(nodeIds, tid))
+    || (opts.noGroups && state.nodes[tid] && state.nodes[tid].kind === 'group');
   const rowsHtml = (pid, depth) => kidsOf(pid).map((n) => {
     const kids = kidsOf(n.id).filter((k) => !nodeIds.includes(k.id));
     if (nodeIds.includes(n.id)) return '';
@@ -1042,12 +1680,14 @@ function openPicker(payload, onDone) {
     return n.kind === 'room' ? `<div class="p-room" style="${roomVars(n)}">${row}${body}</div>` : row + body;
   }).join('');
   openSheet({
-    html: () => `<h2>Move ${esc(label)}</h2><div class="sub">Choose where it should go.</div>
+    html: () => `<h2>${opts.title ? esc(opts.title) : `Move ${esc(label)}`}</h2><div class="sub">Choose where it should go.</div>
       <div class="picker">${rowsHtml(null, 0)}</div>
       <div class="field"><span class="label">To</span><div>${sel ? esc(pathText(sel)) : '<span class="note">Nothing chosen</span>'}</div></div>
       <div class="actions"><button class="btn" data-close>Cancel</button>
-        <button class="btn" data-pact="plan" ${sel ? '' : 'disabled'}>Propose move</button>
-        <button class="btn primary" data-pact="move" ${sel ? '' : 'disabled'}>Move</button></div>`,
+        ${opts.choose
+    ? `<button class="btn primary" data-pact="choose" ${sel ? '' : 'disabled'}>Use this place</button>`
+    : `<button class="btn" data-pact="plan" ${sel ? '' : 'disabled'}>Propose move</button>
+        <button class="btn primary" data-pact="move" ${sel ? '' : 'disabled'}>Move</button>`}</div>`,
     click(e) {
       const t = e.target.closest('[data-ptoggle]');
       if (t) { exp[t.dataset.ptoggle] = !exp[t.dataset.ptoggle]; drawSheet(); return; }
@@ -1055,9 +1695,10 @@ function openPicker(payload, onDone) {
       if (p && !p.disabled) { sel = p.dataset.pick; drawSheet(); return; }
       const a = e.target.closest('[data-pact]');
       if (a && sel) {
+        if (a.dataset.pact === 'choose') { opts.choose(sel); return; }
         closeSheet();
         applyMove(payload, sel, a.dataset.pact === 'move' ? 'move' : 'plan');
-        if (onDone) onDone();
+        if (opts.onDone) opts.onDone();
       }
     },
   });
@@ -1090,18 +1731,22 @@ function promptDrop(payload, target) {
 /* ----- selection actions ----- */
 function openBulkSheet() {
   const ids = [...ui.selected].filter((id) => state.items[id]);
-  const draft = { tags: '', usage: [], usageTouched: false, freq: undefined };
+  const draft = { tags: '', usage: [], usageTouched: false, freq: undefined, seasonMode: 'keep', season: defaultSeason() };
   openSheet({
     html: () => `<h2>Details for ${ids.length} item${ids.length === 1 ? '' : 's'}</h2>
       <div class="sub">Only what you change here is applied.</div>
       <div class="field"><label for="f-tags">Add tags (comma separated)</label><input id="f-tags" type="text" value="${esc(draft.tags)}" autocapitalize="none">${tagSuggestHtml(parseTags(draft.tags))}</div>
-      <div class="field"><span class="label">Used in ${draft.usageTouched ? '(replaces existing)' : ''}</span>${usageOptions().length ? segHtml('usage', usageOptions(), draft.usage) : '<div class="note">Add rooms first.</div>'}</div>
+      <div class="field"><span class="label">${USED_IN_LABEL}${draft.usageTouched ? ' <span class="note">(replaces existing)</span>' : ''}</span>${usageOptions().length ? segHtml('usage', usageOptions(), draft.usage) : '<div class="note">Add rooms first.</div>'}</div>
       <div class="field"><span class="label">How often they’re used</span>${segHtml('freq', FREQS, draft.freq)}</div>
+      <div class="field"><span class="label">Seasonal</span>${segHtml('smode', [['keep', 'Leave as is'], ['on', 'Seasonal'], ['off', 'Not seasonal']], draft.seasonMode)}
+        ${draft.seasonMode === 'on' ? `<div class="row" style="margin-top:6px">In use from ${monthSelect('f-sstart', draft.season.start)} to ${monthSelect('f-send', draft.season.end)}</div>` : ''}</div>
       <div class="actions"><button class="btn" data-close>Cancel</button><button class="btn primary" data-act="apply">Apply</button></div>`,
+    change(e) { if (e.target.matches('#f-sstart,#f-send')) draft.season = readSeason(sheetBody) || draft.season; },
     click(e) {
       const tf = $('#f-tags', sheetBody); if (tf) draft.tags = tf.value;
-      const b = e.target.closest('[data-usage],[data-freq],[data-addtag],[data-act]');
+      const b = e.target.closest('[data-usage],[data-freq],[data-addtag],[data-smode],[data-act]');
       if (!b) return;
+      if (b.dataset.smode) { draft.season = readSeason(sheetBody) || draft.season; draft.seasonMode = b.dataset.smode; drawSheet(); return; }
       if (b.dataset.usage) { draft.usageTouched = true; const r = b.dataset.usage; draft.usage = draft.usage.includes(r) ? draft.usage.filter((x) => x !== r) : [...draft.usage, r]; drawSheet(); return; }
       if (b.dataset.freq) { draft.freq = draft.freq === b.dataset.freq ? undefined : b.dataset.freq; drawSheet(); return; }
       if (b.dataset.addtag) { const t = parseTags(draft.tags); if (!t.includes(b.dataset.addtag)) t.push(b.dataset.addtag); draft.tags = t.join(', '); drawSheet(); return; }
@@ -1112,6 +1757,8 @@ function openBulkSheet() {
           for (const t of add) if (!it.tags.includes(t)) it.tags.push(t);
           if (draft.usageTouched) it.usage = [...draft.usage];
           if (draft.freq !== undefined) it.freq = draft.freq;
+          if (draft.seasonMode === 'on') it.season = { ...draft.season };
+          if (draft.seasonMode === 'off') it.season = null;
         }
         closeSheet(); commit(); toast(`Updated ${ids.length} item${ids.length === 1 ? '' : 's'}`);
       }
@@ -1178,6 +1825,19 @@ function openSettings() {
         <input type="file" id="f-import" accept=".json,application/json" class="hidden">
         <div class="note" style="margin-top:6px">Importing replaces everything on this device.</div></div>
       <div class="field"><span class="label">Tags</span><button class="btn" data-act="tags">Manage tags</button></div>
+      <h3 class="set-head">Suggestions</h3>
+      <div class="field"><span class="label">In a prime room, suggest moving out anything used less often than</span>${segHtml('lvlprm', LEVEL_OPTIONS, state.settings.primeRoomMin)}</div>
+      <div class="field"><span class="label">In prime storage in a normal room, suggest moving out anything used less often than</span>${segHtml('lvlpsm', LEVEL_OPTIONS, state.settings.primeStorageMin)}</div>
+      <div class="field"><span class="label">In an awkward room or spot, suggest moving up anything used at least</span>${segHtml('lvlawk', LEVEL_OPTIONS, state.settings.awkwardUpAt)}</div>
+      <div class="field"><label for="set-seasonGap">Seasonal items count as rarely used when out of season for at least (months)</label>
+        <input id="set-seasonGap" type="number" min="0" max="11" inputmode="numeric" value="${state.settings.seasonGap}" style="max-width:90px"></div>
+      <div class="field"><label for="set-createMin">Suggest a new group when at least this many items match</label>
+        <input id="set-createMin" type="number" min="2" max="50" inputmode="numeric" value="${state.settings.createMin}" style="max-width:90px"></div>
+      <div class="field"><label for="set-oddOneOutMin">Suggest removing an item that doesn’t fit only in groups of at least</label>
+        <input id="set-oddOneOutMin" type="number" min="3" max="50" inputmode="numeric" value="${state.settings.oddOneOutMin}" style="max-width:90px"></div>
+      <div class="field"><label for="set-backupDays">Remind me to back up after (days)</label>
+        <input id="set-backupDays" type="number" min="1" max="365" inputmode="numeric" value="${state.settings.backupDays}" style="max-width:90px"></div>
+      <div class="field"><button class="btn small" data-act="set-defaults">Restore default settings</button></div>
       <div class="field"><span class="label">Storage</span><div class="note" id="persist-note">Checking…</div></div>
       <div class="actions"><button class="btn primary" data-close>Done</button></div>
       <div class="version">Stowed ${APP_VERSION}</div>`;
@@ -1192,14 +1852,28 @@ function openSettings() {
     },
     change(e) {
       if (e.target.id === 'f-import' && e.target.files[0]) importBackup(e.target.files[0]);
+      const m = e.target.id && e.target.id.match(/^set-(seasonGap|createMin|oddOneOutMin|backupDays)$/);
+      if (m) {
+        state.settings = normalizeSettings({ ...state.settings, [m[1]]: e.target.value });
+        e.target.value = state.settings[m[1]];
+        commit();
+      }
     },
     click(e) {
+      const lv = e.target.closest('[data-lvlprm],[data-lvlpsm],[data-lvlawk]');
+      if (lv) {
+        const key = lv.dataset.lvlprm ? 'primeRoomMin' : lv.dataset.lvlpsm ? 'primeStorageMin' : 'awkwardUpAt';
+        state.settings[key] = lv.dataset.lvlprm || lv.dataset.lvlpsm || lv.dataset.lvlawk;
+        commit(); drawSheet();
+        return;
+      }
       const b = e.target.closest('[data-act]');
       if (!b) return;
       if (b.dataset.act === 'download') exportBackup(false);
       if (b.dataset.act === 'share') exportBackup(true);
       if (b.dataset.act === 'import') $('#f-import', sheetBody).click();
       if (b.dataset.act === 'tags') openTagManager();
+      if (b.dataset.act === 'set-defaults') { state.settings = Object.assign({}, SETTING_DEFAULTS); commit(); drawSheet(); toast('Default settings restored'); }
     },
   });
 }
@@ -1253,7 +1927,7 @@ function renameTag(oldTag) {
 
 /* ----- backup ----- */
 function backupBlob() {
-  const data = { app: 'stowed', schema: 1, version: APP_VERSION, exported: new Date().toISOString(), nodes: state.nodes, items: state.items };
+  const data = { app: 'stowed', schema: 1, version: APP_VERSION, exported: new Date().toISOString(), nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings };
   return new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
 }
 function backupName() { return `stowed-backup-${new Date().toISOString().slice(0, 10)}.json`; }
@@ -1306,9 +1980,11 @@ function importBackup(file) {
       ok: 'Replace', danger: true,
       onOk: () => {
         const snap = snapshot();
-        const next = normalize({ nodes: data.nodes, items: data.items, meta: state.meta });
+        const next = normalize({ nodes: data.nodes, items: data.items, dismissed: data.dismissed, settings: data.settings || state.settings, meta: state.meta });
         state.nodes = next.nodes;
         state.items = next.items;
+        state.dismissed = next.dismissed;
+        state.settings = next.settings;
         state.meta.lastImport = { at: Date.now(), exported: data.exported || null };
         ui.selected.clear();
         commit();
@@ -1378,7 +2054,27 @@ function handleAction(action, el) {
       render();
       break;
     case 'sel-details': openBulkSheet(); break;
-    case 'sel-move': openPicker({ items: [...ui.selected] }, () => { ui.selected.clear(); render(); }); break;
+    case 'sug-scope':
+      openPicker({}, {
+        title: 'Suggestions for…',
+        choose: (sel) => showSuggestionsFor({ kind: 'node', id: sel }),
+      });
+      break;
+    case 'sug-scope-all': showSuggestionsFor(null); break;
+    case 'reset-sugs':
+      confirmSheet({
+        title: 'Reset suggestions?',
+        text: 'Everything you’ve dismissed is forgotten and suggestions are worked out again from scratch.',
+        ok: 'Reset',
+        onOk: () => {
+          const snap = snapshot();
+          state.dismissed = {};
+          commit();
+          toast(`Suggestions recalculated: ${lastSugs.length}`, snap);
+        },
+      });
+      break;
+    case 'sel-move': openPicker({ items: [...ui.selected] }, { onDone: () => { ui.selected.clear(); render(); } }); break;
     case 'sel-group': groupSelection(); break;
     case 'sel-delete': {
       const ids = [...ui.selected];
@@ -1431,6 +2127,8 @@ function itemTap(id, isGhost) {
 document.addEventListener('click', (e) => {
   if (e.target.closest('#sheet-root') || e.target.closest('#toast')) return;
   if (Date.now() < suppressClickUntil) { suppressClickUntil = 0; e.preventDefault(); e.stopPropagation(); return; }
+  const sa = e.target.closest('[data-sact]');
+  if (sa) { handleSuggestion(sa.dataset.sact, lastSugs[+sa.dataset.sug]); return; }
   const a = e.target.closest('[data-action]');
   if (a) { handleAction(a.dataset.action, a); return; }
   const it = e.target.closest('[data-item]');
@@ -1453,7 +2151,15 @@ let press = null;
 let drag = null;
 let autoScrollRaf = null;
 
+/* Draggable things: tree chips and rows, or chips inside the split sheet. */
+function dragSource(target) {
+  if (sheetCtl) return sheetCtl.split ? target.closest('#sheet-body [data-split-drag]') : null;
+  if (target.closest('.mini-btn')) return null;
+  return target.closest('#app [data-drag-item], #app [data-drag-node]');
+}
+
 function payloadFor(el) {
+  if (el.dataset.splitDrag) return { split: el.dataset.splitDrag, items: [], nodes: [] };
   if (el.dataset.dragItem) {
     const id = el.dataset.dragItem;
     if (ui.select && ui.selected.has(id)) return { items: [...ui.selected], nodes: [] };
@@ -1461,7 +2167,8 @@ function payloadFor(el) {
   }
   return { items: [], nodes: [el.dataset.dragNode] };
 }
-function payloadLabel(p) {
+function payloadLabel(p, el) {
+  if (p.split) return el.textContent;
   const n = p.items.length + p.nodes.length;
   if (n !== 1) return `${n} things`;
   const x = state.items[p.items[0]] || state.nodes[p.nodes[0]];
@@ -1471,15 +2178,15 @@ function payloadLabel(p) {
 function startDrag(el, x, y) {
   press = null;
   const payload = payloadFor(el);
-  drag = { payload, el, x, y, startX: x, startY: y, target: null, hoverId: null, hoverSince: 0 };
+  drag = { payload, el, x, y, startX: x, startY: y, target: null, hoverId: null, hoverSince: 0, split: !!payload.split };
   const g = $('#drag-ghost');
-  g.textContent = payloadLabel(payload);
+  g.textContent = payloadLabel(payload, el);
   g.classList.remove('hidden');
   document.body.classList.add('dragging');
   el.classList.add('dragging-src');
   if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) { /* ignore */ } }
   moveDrag(x, y);
-  autoScroll();
+  if (!drag.split) autoScroll();
 }
 
 function moveDrag(x, y) {
@@ -1489,6 +2196,12 @@ function moveDrag(x, y) {
   g.style.top = `${y}px`;
   document.querySelectorAll('.drop-hover').forEach((n) => n.classList.remove('drop-hover'));
   const under = document.elementFromPoint(x, y);
+  if (drag.split) {
+    const side = under && under.closest('#sheet-body [data-split-side]');
+    drag.target = side ? side.dataset.splitSide : null;
+    if (side) side.classList.add('drop-hover');
+    return;
+  }
   const hit = under && under.closest('#app [data-drop]');
   drag.target = hit ? hit.dataset.drop : null;
   if (hit) hit.classList.add('drop-hover');
@@ -1527,15 +2240,17 @@ function endDrag(cancelled) {
   suppressClickUntil = Date.now() + 120;
   // A long press released without moving is not a drop.
   const moved = Math.hypot(d.x - d.startX, d.y - d.startY) > 15;
-  if (!cancelled && moved && d.target) promptDrop(d.payload, d.target);
+  if (cancelled || !moved || !d.target) return;
+  if (d.split) { if (sheetCtl && sheetCtl.splitDrop) sheetCtl.splitDrop(d.payload.split, d.target); }
+  else promptDrop(d.payload, d.target);
 }
 
 function cancelPress() { if (press) { clearTimeout(press.timer); press = null; } }
 
 document.addEventListener('touchstart', (e) => {
-  if (e.touches.length !== 1 || sheetCtl) { cancelPress(); return; }
-  const el = e.target.closest('#app [data-drag-item], #app [data-drag-node]');
-  if (!el || e.target.closest('.mini-btn')) return;
+  if (e.touches.length !== 1) { cancelPress(); return; }
+  const el = dragSource(e.target);
+  if (!el) return;
   const t = e.touches[0];
   press = { el, x: t.clientX, y: t.clientY, timer: setTimeout(() => { if (press) startDrag(press.el, press.x, press.y); }, 380) };
 }, { passive: true });
@@ -1555,9 +2270,9 @@ document.addEventListener('touchcancel', () => { endDrag(true); cancelPress(); }
 document.addEventListener('contextmenu', (e) => { if (press || drag) e.preventDefault(); });
 
 document.addEventListener('mousedown', (e) => {
-  if (e.button !== 0 || sheetCtl) return;
-  const el = e.target.closest('#app [data-drag-item], #app [data-drag-node]');
-  if (!el || e.target.closest('.mini-btn')) return;
+  if (e.button !== 0) return;
+  const el = dragSource(e.target);
+  if (!el) return;
   press = { el, x: e.clientX, y: e.clientY, mouse: true };
 });
 document.addEventListener('mousemove', (e) => {
@@ -1589,7 +2304,9 @@ async function init() {
   if (!loaded && storageOk) flushSave();
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW registration failed', e));
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+      .then((r) => r.update())
+      .catch((e) => console.warn('SW registration failed', e));
   }
 }
 init();
