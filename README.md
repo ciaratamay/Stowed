@@ -2,7 +2,7 @@
 
 Home inventory app: what's in each room, where it should go, and searchable in a hurry. Installable web app (PWA), all data stored on the device, with backup files for safekeeping and sharing.
 
-Version 0.4.0: listing, locations, planned moves and suggestions.
+Version 0.5.0: listing, locations, planned moves and suggestions.
 
 ## Put it online (GitHub Pages)
 
@@ -39,9 +39,15 @@ Everything is stored in the browser's storage on that phone. Nothing is sent any
 - **Needs info** lists items missing tags or a frequency. Items without a frequency aren't considered for suggestions.
 - **Seasonal:** tick it under an item's frequency and choose the months it's in use (e.g. May to Sep). Outside those months it counts as rarely used, so it gets suggested for deep storage, as long as the off-season is at least the gap set in Settings (3 months by default). It keeps counting as rarely used until the start month comes round; nothing is suggested to come back early.
 - **Suggestions** tab:
-  - *Move out of prime*: by default, anything used less than weekly in a prime room, or less than monthly in prime storage in a normal room.
-  - *Move somewhere easier*: by default, anything used weekly or more in an awkward room or awkward storage.
-  - All these thresholds, the seasonal gap, the minimum sizes for group suggestions and the backup reminder can be changed in Settings › Suggestions.
+  - **Moving out:**
+    - The room counts first. To be in a prime room, an item must be used at least weekly, even if that's the room it's used in.
+    - To be in prime storage (any room), an item must be used at least daily. A weekly cake tin can stay in the kitchen, just not on the prime shelf; the suggestion points at ordinary storage in the same room.
+  - **Moving in:** for anything used at least weekly:
+    - The rooms it's used in are its ideal rooms, whatever their primeness. Soap used daily in a normal bathroom stays put.
+    - If it's kept in a different room, it's suggested to move to the room it's used in.
+    - If it's used in any room, it's suggested to move to a prime room (as long as it's used often enough for one).
+    - If it's in an awkward spot, it's suggested to move somewhere easier.
+  - All three frequencies, the seasonal gap, the minimum sizes for group suggestions and the backup reminder are in Settings › Suggestions. Changing a suggestion setting clears dismissed suggestions and works them out again.
   - Emergency items are never flagged for being in a prime or awkward spot, but they are matched with groups and items sharing their tags, whatever their frequency (burn gel with the first aid group, say).
   - Where to move to comes from a matching group (same frequency, a shared tag, a compatible room), or from a tag home.
   - *Split group*: a group with some members suited to its spot and some not. Tap or drag items between the two sides; for a container like a pouch, drag the container to the side that keeps it.
@@ -53,7 +59,7 @@ Everything is stored in the browser's storage on that phone. Nothing is sent any
   - **Dismiss all for this item / group** stops all suggestions for it.
   - Both kinds of dismissal last until that item's tags, rooms or frequency change.
   - **Reset suggestions** forgets every dismissal and works suggestions out again from scratch.
-- Arrows on chips (↓ / ↑) mark items with a suggestion to move out of prime or up from an awkward spot.
+- Arrows on chips mark items with a suggestion: ↓ to move out of prime space, ↑ to move closer to where it's used or out of an awkward spot.
 
 ## Not built yet
 

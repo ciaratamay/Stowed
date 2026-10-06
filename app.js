@@ -4,7 +4,7 @@
    Stowed — home inventory. Local-only (IndexedDB), backup files.
    ============================================================ */
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.5.0';
 const LIMBO = 'limbo';
 const FREQS = [
   ['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'],
@@ -200,7 +200,7 @@ function validSeason(se) {
 function normalizeSettings(o) {
   const out = Object.assign({}, SETTING_DEFAULTS);
   if (o && typeof o === 'object') {
-    for (const k of ['primeRoomMin', 'primeStorageMin', 'awkwardUpAt']) if (LEVEL_OPTIONS.some(([v]) => v === o[k])) out[k] = o[k];
+    for (const k of ['primeRoomMin', 'primeStorageAt', 'promoteAt']) if (LEVEL_OPTIONS.some(([v]) => v === o[k])) out[k] = o[k];
     const num = (k, lo, hi) => { const n = parseInt(o[k], 10); if (n >= lo && n <= hi) out[k] = n; };
     num('seasonGap', 0, 11); num('createMin', 2, 50); num('oddOneOutMin', 3, 50); num('backupDays', 1, 365);
   }
@@ -532,9 +532,9 @@ function effFreq(it) {
 
 /* ----- Suggestion settings (Settings › Suggestions) ----- */
 const SETTING_DEFAULTS = {
-  primeRoomMin: 'weekly',      // in a prime room, keep things used at least this often
-  primeStorageMin: 'monthly',  // in prime storage in a normal room, keep things used at least this often
-  awkwardUpAt: 'weekly',       // in an awkward room or spot, suggest moving up things used at least this often
+  primeRoomMin: 'weekly',      // to be in a prime room, an item must be used at least this often
+  primeStorageAt: 'daily',     // to be in prime storage (any room), an item must be used at least this often
+  promoteAt: 'weekly',         // items used at least this often are pulled to their usage room and out of awkward spots
   seasonGap: 3,                // months out of season before a seasonal item counts as rarely used
   createMin: 2,                // items needed to suggest a new group
   oddOneOutMin: 3,             // group size before "doesn't fit its group" is suggested
@@ -542,8 +542,10 @@ const SETTING_DEFAULTS = {
 };
 const LEVEL_OPTIONS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['occasionally', 'Occasionally'], ['off', 'Off']];
 
-/* Does an item of this frequency suit this spot? null = fine. */
-function thresholdFor(freq, nodeId, label) {
+/* Does an item of this frequency (and these usage rooms) suit this spot? null = fine.
+   Moving out: the room's primeness is checked first, then the storage's.
+   Moving in: the rooms an item is used in are its ideal rooms, whatever their primeness. */
+function thresholdFor(freq, nodeId, label, usage = []) {
   if (!freq || freq === 'emergency' || !state.nodes[nodeId]) return null;
   const room = roomOf(nodeId);
   if (!room || room.id === LIMBO) return null;
@@ -551,16 +553,35 @@ function thresholdFor(freq, nodeId, label) {
   const st = storageAccess(nodeId);
   const r = FREQ_RANK[freq];
   const used = label || `Used ${FREQ_LABEL[freq].toLowerCase()}`;
-  if (room.access === 'prime' && S.primeRoomMin !== 'off' && r > FREQ_RANK[S.primeRoomMin]) return { kind: 'out', reason: `${used}, but in a prime room` };
-  if (room.access === 'normal' && st === 'prime' && S.primeStorageMin !== 'off' && r > FREQ_RANK[S.primeStorageMin]) return { kind: 'out', reason: `${used}, but in prime storage` };
-  if ((room.access === 'awkward' || st === 'awkward') && S.awkwardUpAt !== 'off' && r <= FREQ_RANK[S.awkwardUpAt]) {
-    return { kind: 'up', reason: `${used}, but in an awkward ${room.access === 'awkward' ? 'room' : 'spot'}` };
+  const meets = (level) => level !== 'off' && r <= FREQ_RANK[level];
+  const below = (level) => level !== 'off' && r > FREQ_RANK[level];
+  // 1. Too rarely used for a prime room (even if it's used there)
+  if (room.access === 'prime' && below(S.primeRoomMin)) {
+    return { kind: 'out', label: 'Move out of prime room', reason: `${used}: too rarely for a prime room` };
+  }
+  // 2. Too rarely used for prime storage
+  if (st === 'prime' && below(S.primeStorageAt)) {
+    return { kind: 'out', label: 'Move out of prime storage', reason: `${used}: too rarely for prime storage` };
+  }
+  if (!meets(S.promoteAt)) return null;
+  const usageNames = usage.map((u) => state.nodes[u] && state.nodes[u].name).filter(Boolean);
+  // 3. Used often, but not in a room it's used in
+  if (usage.length && !usage.includes(room.id)) {
+    return { kind: 'up', label: 'Move to where it’s used', reason: `${used} in ${usageNames.join(' / ')}, but kept in ${room.name}`, toRooms: usage };
+  }
+  // 4. Used anywhere, often enough for a prime room, but not in one
+  if (!usage.length && room.access !== 'prime' && meets(S.primeRoomMin) && Object.values(state.nodes).some((n) => n.kind === 'room' && n.access === 'prime')) {
+    return { kind: 'up', label: 'Move to a prime room', reason: `${used} in any room: often enough for a prime room` };
+  }
+  // 5. Used often, but somewhere awkward (an awkward room only counts if it isn't a room it's used in)
+  if (st === 'awkward' || (room.access === 'awkward' && !usage.includes(room.id))) {
+    return { kind: 'up', label: 'Move somewhere easier', reason: `${used}, but in an awkward ${st === 'awkward' ? 'spot' : 'room'}` };
   }
   return null;
 }
 function itemThreshold(it, nodeId) {
   const off = isOffSeason(it);
-  return thresholdFor(effFreq(it), nodeId, off ? `Out of season (${seasonText(it.season)}) until ${MONTHS[it.season.start - 1]}` : null);
+  return thresholdFor(effFreq(it), nodeId, off ? `Out of season (${seasonText(it.season)}) until ${MONTHS[it.season.start - 1]}` : null, it.usage);
 }
 
 /* A group's profile, worked out from its members. */
@@ -625,11 +646,11 @@ function computeSuggestions() {
     const pick = cands.find((c) => !isDis(itemKey(sub, it, c.group.id), sig));
     return pick ? pick.group : null;
   };
-  const pushItem = (sub, it, dest, reason) => {
+  const pushItem = (sub, it, dest, reason, label) => {
     const sig = sigItems([it]);
     const key = itemKey(sub, it, dest && dest.id);
     if (isDis(key, sig)) return false;
-    out.push({ key, type: 'item', sub, sig, item: it.id, dest: dest ? dest.id : null, title: it.name, reason });
+    out.push({ key, type: 'item', sub, sig, item: it.id, dest: dest ? dest.id : null, title: it.name, reason, label });
     return true;
   };
 
@@ -650,12 +671,12 @@ function computeSuggestions() {
         else if (meets.length) {
           out.push({
             key: `split:${g.id}`, type: 'split', sig: sigItems(members), group: g.id, kind, flagged: flaggedIds,
-            title: g.name, reason: `${flagged.length} of ${members.length} items ${kind === 'out' ? 'are used too rarely for this spot' : 'are used too often for this awkward spot'}`,
+            title: g.name, reason: `${flagged.length} of ${members.length} items ${kind === 'out' ? 'are used too rarely for this spot' : 'belong somewhere easier or closer to where they’re used'}`,
           });
         } else {
           out.push({
             key: `gmove:${g.id}`, type: 'gmove', sig: sigItems(members), node: g.id, kind,
-            title: g.name, reason: kind === 'out' ? 'Everything in it is used too rarely for this prime spot' : 'Everything in it is used too often for this awkward spot',
+            title: g.name, reason: kind === 'out' ? 'Everything in it is used too rarely for this prime spot' : 'Everything in it belongs somewhere easier or closer to where it’s used',
           });
         }
         flaggedIds.forEach((id) => handled.add(id));
@@ -692,7 +713,24 @@ function computeSuggestions() {
   for (const it of loose) {
     const t = itemThreshold(it, it.parent);
     if (t) {
-      if (pushItem(t.kind, it, joinFor(it, t.kind), t.reason)) handled.add(it.id);
+      let dest = joinFor(it, t.kind);
+      if (!dest && t.kind === 'up') {
+        // No matching group: point at the room itself (its usage room, or a prime room for any-room items)
+        const rooms = t.toRooms || (!it.usage.length ? Object.values(state.nodes).filter((n) => n.kind === 'room' && n.access === 'prime').sort((x, y) => x.order - y.order).map((n) => n.id) : []);
+        const sig = sigItems([it]);
+        const rid = rooms.find((id) => id !== it.parent && state.nodes[id] && !itemThreshold(it, id) && !isDis(itemKey(t.kind, it, id), sig));
+        if (rid) dest = state.nodes[rid];
+      }
+      if (!dest && t.label === 'Move out of prime storage') {
+        // Ordinary storage in the same room
+        const room = roomOf(it.parent);
+        const sig = sigItems([it]);
+        const spot = Object.values(state.nodes)
+          .filter((n) => n.kind === 'storage' && n.id !== it.parent && roomOf(n.id) === room && !itemThreshold(it, n.id) && !isDis(itemKey(t.kind, it, n.id), sig))
+          .sort((x, y) => x.order - y.order)[0];
+        if (spot) dest = spot;
+      }
+      if (pushItem(t.kind, it, dest, t.reason, t.label)) handled.add(it.id);
     } else {
       const join = joinFor(it, 'join');
       if (join && pushItem('join', it, join, `Matches group “${join.name}”`)) handled.add(it.id);
@@ -737,7 +775,7 @@ function computeSuggestions() {
     const counts = {};
     for (const i of b.items) counts[i.parent] = (counts[i.parent] || 0) + 1;
     const place = Object.keys(counts).sort((x, y) => counts[y] - counts[x])
-      .find((p) => p !== LIMBO && !thresholdFor(b.freq, p)) || null;
+      .find((p) => p !== LIMBO && b.items.every((i) => !itemThreshold(i, p))) || null;
     const ids = [...b.ids].sort();
     const roomName = b.room !== '*' && state.nodes[b.room] ? ` used in ${state.nodes[b.room].name}` : '';
     out.push({
@@ -1120,6 +1158,7 @@ function sugLabel(s) {
   if (s.type === 'gmove') return s.kind === 'out' ? 'Move group out of prime' : 'Move group somewhere easier';
   if (s.type === 'create') return 'Create group';
   if (s.type === 'merge') return 'Merge groups';
+  if (s.label) return s.label;
   return { out: 'Move out of prime', up: 'Move somewhere easier', home: 'Tag home', remove: 'Doesn’t fit its group', join: 'Join group' }[s.sub];
 }
 
@@ -1826,9 +1865,10 @@ function openSettings() {
         <div class="note" style="margin-top:6px">Importing replaces everything on this device.</div></div>
       <div class="field"><span class="label">Tags</span><button class="btn" data-act="tags">Manage tags</button></div>
       <h3 class="set-head">Suggestions</h3>
-      <div class="field"><span class="label">In a prime room, suggest moving out anything used less often than</span>${segHtml('lvlprm', LEVEL_OPTIONS, state.settings.primeRoomMin)}</div>
-      <div class="field"><span class="label">In prime storage in a normal room, suggest moving out anything used less often than</span>${segHtml('lvlpsm', LEVEL_OPTIONS, state.settings.primeStorageMin)}</div>
-      <div class="field"><span class="label">In an awkward room or spot, suggest moving up anything used at least</span>${segHtml('lvlawk', LEVEL_OPTIONS, state.settings.awkwardUpAt)}</div>
+      <div class="note">Changing any of these clears dismissed suggestions and works them out again.</div>
+      <div class="field"><span class="label">To be in a prime room, an item must be used at least</span>${segHtml('lvlprm', LEVEL_OPTIONS, state.settings.primeRoomMin)}</div>
+      <div class="field"><span class="label">To be in prime storage, an item must be used at least</span>${segHtml('lvlpsm', LEVEL_OPTIONS, state.settings.primeStorageAt)}</div>
+      <div class="field"><span class="label">Items used at least this often are suggested to move to the room they’re used in, and out of awkward spots</span>${segHtml('lvlawk', LEVEL_OPTIONS, state.settings.promoteAt)}</div>
       <div class="field"><label for="set-seasonGap">Seasonal items count as rarely used when out of season for at least (months)</label>
         <input id="set-seasonGap" type="number" min="0" max="11" inputmode="numeric" value="${state.settings.seasonGap}" style="max-width:90px"></div>
       <div class="field"><label for="set-createMin">Suggest a new group when at least this many items match</label>
@@ -1856,14 +1896,16 @@ function openSettings() {
       if (m) {
         state.settings = normalizeSettings({ ...state.settings, [m[1]]: e.target.value });
         e.target.value = state.settings[m[1]];
+        if (m[1] !== 'backupDays') state.dismissed = {};
         commit();
       }
     },
     click(e) {
       const lv = e.target.closest('[data-lvlprm],[data-lvlpsm],[data-lvlawk]');
       if (lv) {
-        const key = lv.dataset.lvlprm ? 'primeRoomMin' : lv.dataset.lvlpsm ? 'primeStorageMin' : 'awkwardUpAt';
+        const key = lv.dataset.lvlprm ? 'primeRoomMin' : lv.dataset.lvlpsm ? 'primeStorageAt' : 'promoteAt';
         state.settings[key] = lv.dataset.lvlprm || lv.dataset.lvlpsm || lv.dataset.lvlawk;
+        state.dismissed = {};
         commit(); drawSheet();
         return;
       }
@@ -1873,7 +1915,7 @@ function openSettings() {
       if (b.dataset.act === 'share') exportBackup(true);
       if (b.dataset.act === 'import') $('#f-import', sheetBody).click();
       if (b.dataset.act === 'tags') openTagManager();
-      if (b.dataset.act === 'set-defaults') { state.settings = Object.assign({}, SETTING_DEFAULTS); commit(); drawSheet(); toast('Default settings restored'); }
+      if (b.dataset.act === 'set-defaults') { state.settings = Object.assign({}, SETTING_DEFAULTS); state.dismissed = {}; commit(); drawSheet(); toast('Default settings restored'); }
     },
   });
 }

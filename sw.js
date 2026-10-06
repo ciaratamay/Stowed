@@ -1,5 +1,5 @@
 // Network-first for app files so updates show up; cache fallback when offline.
-const CACHE = 'stowed-v5';
+const CACHE = 'stowed-v6';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
