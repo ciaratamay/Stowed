@@ -4,7 +4,7 @@
    Stowed — home inventory. Local-only (IndexedDB), backup files.
    ============================================================ */
 
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.6.0';
 const LIMBO = 'limbo';
 const FREQS = [
   ['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'],
@@ -123,6 +123,7 @@ function freshState() {
     items: {},
     dismissed: {},
     settings: Object.assign({}, SETTING_DEFAULTS),
+    tasks: {},
     meta: { lastBackup: null, lastImport: null, created: Date.now() },
   };
 }
@@ -153,6 +154,8 @@ function normalize(s) {
   s.dismissed = s.dismissed && typeof s.dismissed === 'object' ? s.dismissed : {};
   // Added in 0.4.0: editable suggestion settings and seasonal items.
   s.settings = normalizeSettings(s.settings);
+  // Added in 0.6.0: to-do tasks, optionally attached to an item, container or room.
+  s.tasks = normalizeTasks(s.tasks);
   if (!s.nodes[LIMBO]) s.nodes[LIMBO] = freshState().nodes[LIMBO];
   const L = s.nodes[LIMBO];
   Object.assign(L, { kind: 'room', system: true, name: 'Limbo', parent: null, plan: null, order: 0, color: 'limbo' });
@@ -192,6 +195,20 @@ function normalize(s) {
   return s;
 }
 
+function normalizeTasks(t) {
+  const out = {};
+  if (!t || typeof t !== 'object') return out;
+  for (const [id, x] of Object.entries(t)) {
+    if (!x || typeof x !== 'object') continue;
+    const target = x.target && (x.target.kind === 'item' || x.target.kind === 'node') && typeof x.target.id === 'string' ? { kind: x.target.kind, id: x.target.id } : null;
+    out[id] = {
+      id, text: String(x.text || ''), target, targetName: String(x.targetName || ''),
+      done: !!x.done, order: typeof x.order === 'number' ? x.order : nextOrder(), created: x.created || Date.now(),
+    };
+  }
+  return out;
+}
+
 function validSeason(se) {
   if (!se || typeof se !== 'object') return null;
   const a = parseInt(se.start, 10), b = parseInt(se.end, 10);
@@ -227,6 +244,9 @@ const ui = {
   select: false,
   selected: new Set(),
   sugScope: null, // null = whole house, or { kind: 'node' | 'item', id }
+  taskFilter: 'all', // all | todo | moves
+  taskSort: 'manual', // manual | room
+  showDone: false,
 };
 function loadUi() {
   try {
@@ -234,12 +254,14 @@ function loadUi() {
     if (raw) {
       const o = JSON.parse(raw);
       ui.expanded = o.expanded || {};
-      ui.view = o.view || 'rooms';
+      ui.view = o.view === 'moves' ? 'tasks' : (o.view || 'rooms');
+      if (['all', 'todo', 'moves'].includes(o.taskFilter)) ui.taskFilter = o.taskFilter;
+      if (['manual', 'room'].includes(o.taskSort)) ui.taskSort = o.taskSort;
     }
   } catch (e) { /* storage blocked: defaults are fine */ }
 }
 function saveUi() {
-  try { localStorage.setItem('stowed-ui', JSON.stringify({ expanded: ui.expanded, view: ui.view })); } catch (e) { /* ignore */ }
+  try { localStorage.setItem('stowed-ui', JSON.stringify({ expanded: ui.expanded, view: ui.view, taskFilter: ui.taskFilter, taskSort: ui.taskSort })); } catch (e) { /* ignore */ }
 }
 
 /* ---------- data access ---------- */
@@ -337,13 +359,14 @@ const USED_IN_LABEL = 'Used in <span class="note">(none selected = any room)</sp
 
 /* ---------- commit / undo ---------- */
 function commit() { save(); render(); }
-function snapshot() { return JSON.stringify({ nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings }); }
+function snapshot() { return JSON.stringify({ nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings, tasks: state.tasks }); }
 function restore(snap) {
   const o = JSON.parse(snap);
   state.nodes = o.nodes;
   state.items = o.items;
   state.dismissed = o.dismissed || {};
   state.settings = o.settings || state.settings;
+  state.tasks = o.tasks || {};
   normalize(state);
   ui.selected.clear();
   commit();
@@ -382,6 +405,8 @@ function dissolveCheck(groupIds) {
     if (members.length >= 2) continue;
     for (const it of members) { it.parent = g.parent; if (it.plan === it.parent) it.plan = null; }
     for (const it of Object.values(state.items)) if (it.plan === gid) it.plan = null;
+    // Its tasks move to the container the group was in
+    for (const t of Object.values(state.tasks || {})) if (t.target && t.target.kind === 'node' && t.target.id === gid) t.target = { kind: 'node', id: g.parent };
     delete state.nodes[gid];
     removed.push(g.name);
   }
@@ -445,9 +470,28 @@ function deleteSummary(id) {
   return { items, containers, groups };
 }
 
+/* Tasks on something being deleted are kept, unattached, with the name it had. Call before deleting. */
+function detachTasks(kind, ids) {
+  for (const t of Object.values(state.tasks || {})) {
+    if (t.target && t.target.kind === kind && ids.has(t.target.id)) {
+      const x = kind === 'item' ? state.items[t.target.id] : state.nodes[t.target.id];
+      if (x) t.targetName = kind === 'item' ? x.name : pathText(x.id);
+      t.target = null;
+      t.detached = true;
+    }
+  }
+}
+
 function doDeleteNode(id) {
   const n = state.nodes[id];
   if (!n || n.system) return;
+  // Containers deleted along with this one (groups survive and keep their tasks)
+  const going = new Set([id]);
+  if (n.kind !== 'group') {
+    const walk = (nid) => { for (const c of kidsOf(nid)) if (!(c.kind === 'group' || c.isGroup)) { going.add(c.id); walk(c.id); } };
+    walk(id);
+  }
+  detachTasks('node', going);
   const deleted = new Set();
   if (n.kind === 'group') {
     for (const it of itemsIn(id)) it.parent = n.parent;
@@ -472,6 +516,7 @@ function doDeleteNode(id) {
   for (const x of Object.values(state.nodes)) {
     if (x.plan && (deleted.has(x.plan) || x.plan === x.parent)) x.plan = null;
   }
+
 }
 
 function deleteItems(ids) {
@@ -481,6 +526,7 @@ function deleteItems(ids) {
     if (!it) continue;
     const p = state.nodes[it.parent];
     if (p && p.kind === 'group') groups.add(p.id);
+    detachTasks('item', new Set([id]));
     delete state.items[id];
     ui.selected.delete(id);
   }
@@ -830,6 +876,7 @@ let lastSugs = [];
 function render() {
   RC = buildIndex();
   try {
+    RC.taskCounts = openTaskCounts();
     lastSugs = computeSuggestions();
     RC.sugs = lastSugs;
     RC.marks = suggestionMarks(lastSugs);
@@ -857,7 +904,7 @@ function renderViews() {
   const views = [
     ['rooms', 'Rooms', 0],
     ['sugs', 'Suggestions', lastSugs.length],
-    ['moves', 'Planned moves', moves],
+    ['tasks', 'Tasks', moves + openTasks().length],
     ['needs', 'Needs info', needs],
     ['tags', 'Tags', 0],
   ];
@@ -880,7 +927,7 @@ function renderMain() {
   const main = $('#app');
   if (ui.search.trim()) { main.innerHTML = renderSearch(); return; }
   if (ui.view === 'sugs') main.innerHTML = renderSuggestions();
-  else if (ui.view === 'moves') main.innerHTML = renderMoves();
+  else if (ui.view === 'tasks') main.innerHTML = renderTasks();
   else if (ui.view === 'needs') main.innerHTML = renderNeeds();
   else if (ui.view === 'tags') main.innerHTML = renderTags();
   else main.innerHTML = renderTree();
@@ -921,6 +968,7 @@ function renderRow(n, depth) {
   else if (n.isGroup) tags.push('group');
   if (n.mobile) tags.push('mobile');
   if (n.plan) tags.push('planned');
+  if (RC && RC.taskCounts && RC.taskCounts[n.id]) tags.push(`task${RC.taskCounts[n.id] > 1 ? `s ×${RC.taskCounts[n.id]}` : ''}`);
   const draggable = n.kind !== 'room';
   const count = subtreeCount(n.id);
   return `<div class="node-row" data-node-row="${n.id}" data-drop="${n.id}" ${draggable ? `data-drag-node="${n.id}"` : ''} style="padding-left:${pad}px">
@@ -975,7 +1023,8 @@ function chipHtml(it) {
   if (it.freq === 'emergency') cls.push('emergency');
   if (ui.selected.has(it.id)) cls.push('selected');
   const mark = RC && RC.marks ? RC.marks[it.id] : null;
-  return `<button class="${cls.join(' ')}" data-item="${it.id}" data-drag-item="${it.id}">${esc(it.name)}${it.qty > 1 ? `<span class="qty">×${it.qty}</span>` : ''}${mark ? `<span class="mark" title="${mark === 'out' ? 'Suggested to move somewhere less prime' : 'Suggested to move somewhere easier to reach'}">${mark === 'out' ? '↓' : '↑'}</span>` : ''}</button>`;
+  const tcount = RC && RC.taskCounts ? RC.taskCounts[it.id] : 0;
+  return `<button class="${cls.join(' ')}" data-item="${it.id}" data-drag-item="${it.id}">${esc(it.name)}${it.qty > 1 ? `<span class="qty">×${it.qty}</span>` : ''}${mark ? `<span class="mark" title="${mark === 'out' ? 'Suggested to move somewhere less prime' : 'Suggested to move somewhere easier to reach'}">${mark === 'out' ? '↓' : '↑'}</span>` : ''}${tcount ? '<span class="tmark" title="Has a task">✎</span>' : ''}</button>`;
 }
 
 function ghostChipHtml(it) {
@@ -1017,7 +1066,7 @@ function renderSearch() {
 function renderMoves() {
   const its = Object.values(state.items).filter((i) => i.plan);
   const ns = Object.values(state.nodes).filter((n) => n.plan);
-  if (!its.length && !ns.length) return `<div class="empty">No planned moves. Drag something to a new place and choose “Propose move”.</div>`;
+  if (!its.length && !ns.length) return `<div class="note" style="padding:6px 2px 12px">No planned moves. Drag something to a new place and choose “Propose move”, or accept a suggestion.</div>`;
   const byRoom = new Map();
   const add = (kind, x) => {
     const key = roomOf(x.parent);
@@ -1041,6 +1090,188 @@ function renderMoves() {
     }
   }
   return h;
+}
+
+/* ============================================================
+   Tasks: to-dos, optionally attached to an item, container or room
+   ============================================================ */
+function openTasks() { return Object.values(state.tasks).filter((t) => !t.done); }
+function taskTargetExists(t) {
+  if (!t.target) return false;
+  return t.target.kind === 'item' ? !!state.items[t.target.id] : !!state.nodes[t.target.id];
+}
+function taskRoom(t) {
+  if (!taskTargetExists(t)) return null;
+  return t.target.kind === 'item' ? roomOf(state.items[t.target.id].parent) : roomOf(t.target.id);
+}
+function taskTargetLine(t) {
+  if (!taskTargetExists(t)) return t.targetName ? `${esc(t.targetName)} <span class="note">(no longer exists)</span>` : '';
+  if (t.target.kind === 'item') {
+    const it = state.items[t.target.id];
+    return `<b>${esc(it.name)}</b> · ${esc(pathText(it.parent))}`;
+  }
+  const n = state.nodes[t.target.id];
+  return `${esc(nodeEmoji(n))} <b>${esc(n.name)}</b>${n.parent ? ` · ${esc(pathText(n.parent))}` : ''}`;
+}
+function tasksFor(kind, id) {
+  return Object.values(state.tasks).filter((t) => t.target && t.target.kind === kind && t.target.id === id).sort((a, b) => a.done - b.done || a.order - b.order);
+}
+function openTaskCounts() {
+  const m = {};
+  for (const t of openTasks()) if (taskTargetExists(t)) m[t.target.id] = (m[t.target.id] || 0) + 1;
+  return m;
+}
+
+function taskRow(t, draggable) {
+  const room = taskRoom(t);
+  return `<div class="list-row task-row${t.done ? ' done' : ''}" data-task-row="${t.id}" style="--edge:var(--${(room && room.color) || 'grey'}-e)">
+    ${draggable ? `<span class="task-handle" data-task-drag="${t.id}" aria-label="Drag to reorder">≡</span>` : ''}
+    <input type="checkbox" class="task-check" data-task-done="${t.id}" ${t.done ? 'checked' : ''} aria-label="Done">
+    <div class="grow" data-task-open="${t.id}"><div class="title">${esc(t.text) || '<span class="note">(no text)</span>'}</div>
+      ${t.target || t.targetName ? `<div class="path">${taskTargetLine(t)}</div>` : ''}</div>
+  </div>`;
+}
+
+function renderTasks() {
+  const f = ui.taskFilter;
+  const todo = openTasks();
+  const done = Object.values(state.tasks).filter((t) => t.done).sort((a, b) => b.order - a.order);
+  const movesCount = Object.values(state.items).filter((i) => i.plan).length + Object.values(state.nodes).filter((n) => n.plan).length;
+  let h = `<div class="task-bar">
+      ${segHtml('tfilter', [['all', 'All'], ['todo', `To do (${todo.length})`], ['moves', `Moves (${movesCount})`]], f)}
+      ${f !== 'moves' ? segHtml('tsort', [['manual', 'My order'], ['room', 'By room']], ui.taskSort) : ''}
+    </div>`;
+  if (f !== 'moves') {
+    h += `<div class="section-title"><span>To do</span><button class="btn small" data-action="task-new">+ Task</button></div>`;
+    if (!todo.length) h += `<div class="note" style="padding:4px 2px 12px">No tasks. Add one here, or from any item, container or room.</div>`;
+    else if (ui.taskSort === 'manual') {
+      h += `<div class="task-list">${todo.sort((a, b) => a.order - b.order).map((t) => taskRow(t, true)).join('')}</div>`;
+    } else {
+      const groups = new Map();
+      for (const t of todo.sort((a, b) => a.order - b.order)) {
+        const r = taskRoom(t);
+        const k = r ? r.id : '__none';
+        if (!groups.has(k)) groups.set(k, { room: r, list: [] });
+        groups.get(k).list.push(t);
+      }
+      const keys = [...groups.keys()].sort((a, b) => (a === '__none') - (b === '__none') || (groups.get(a).room ? groups.get(a).room.order : 0) - (groups.get(b).room ? groups.get(b).room.order : 0));
+      for (const k of keys) {
+        const g = groups.get(k);
+        h += `<div class="task-group-head">${g.room ? `${esc(nodeEmoji(g.room))} ${esc(g.room.name)}` : 'Not attached'}</div>`;
+        h += g.list.map((t) => taskRow(t, false)).join('');
+      }
+    }
+    if (done.length) {
+      h += `<div class="row" style="margin:8px 0;justify-content:space-between">
+        <button class="btn small" data-action="task-showdone">${ui.showDone ? 'Hide' : 'Show'} done (${done.length})</button>
+        ${ui.showDone ? '<button class="btn small" data-action="task-cleardone">Delete done tasks</button>' : ''}</div>`;
+      if (ui.showDone) h += done.map((t) => taskRow(t, false)).join('');
+    }
+  }
+  if (f !== 'todo') {
+    h += `<div class="section-title" style="margin-top:16px">Planned moves</div>`;
+    h += renderMoves();
+  }
+  return h;
+}
+
+/* Create or edit a task. target: { kind: 'item' | 'node', id } or null */
+function openTaskSheet(taskId, target, initDraft) {
+  const isNew = !taskId;
+  const t = isNew
+    ? { text: '', target: target || null, targetName: '', done: false }
+    : state.tasks[taskId];
+  if (!t) return;
+  const draft = initDraft || { text: t.text, target: t.target ? { ...t.target } : null };
+  const targetLine = () => {
+    if (!draft.target) return '<span class="note">Not attached</span>';
+    return taskTargetLine({ target: draft.target, targetName: t.targetName });
+  };
+  openSheet({
+    focus: '#f-task',
+    html: () => `<h2>${isNew ? 'New task' : 'Task'}</h2>
+      <div class="field"><label for="f-task">What needs doing</label>
+        <textarea id="f-task" style="min-height:80px" placeholder="e.g. Buy a folder for these">${esc(draft.text)}</textarea></div>
+      <div class="field"><span class="label">Attached to</span><div class="path" style="font-size:14px">${targetLine()}</div>
+        <div class="row" style="margin-top:6px"><button class="btn small" data-act="attach">${draft.target ? 'Change…' : 'Attach to a room or container…'}</button>
+        ${draft.target ? '<button class="btn small" data-act="detach">Remove</button>' : ''}
+        ${draft.target && taskTargetExists({ target: draft.target }) ? '<button class="btn small" data-act="show">Show</button>' : ''}</div></div>
+      <div class="actions ${isNew ? '' : 'spread'}">
+        ${isNew ? '<button class="btn" data-close>Cancel</button>' : '<button class="btn danger" data-act="delete">Delete</button>'}
+        <button class="btn primary" data-act="save">${isNew ? 'Add task' : 'Done'}</button></div>`,
+    input(e) { if (e.target.id === 'f-task') draft.text = e.target.value; },
+    click(e) {
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      const act = b.dataset.act;
+      if (act === 'attach') {
+        openPicker({}, {
+          title: 'Attach task to…',
+          choose: (sel) => { draft.target = { kind: 'node', id: sel }; reopen(); },
+        });
+        return;
+      }
+      if (act === 'detach') { draft.target = null; drawSheet(); return; }
+      if (act === 'show') {
+        closeSheet();
+        if (draft.target.kind === 'item') reveal(state.items[draft.target.id].parent, draft.target.id);
+        else reveal(draft.target.id);
+        return;
+      }
+      if (act === 'delete') {
+        confirmSheet({
+          title: 'Delete this task?', ok: 'Delete', danger: true,
+          onOk: () => { const snap = snapshot(); delete state.tasks[t.id]; commit(); toast('Task deleted', snap); },
+        });
+        return;
+      }
+      if (act === 'save') {
+        const text = draft.text.trim();
+        if (!text) { toast('Write what needs doing'); return; }
+        if (isNew) {
+          const id = uid();
+          state.tasks[id] = { id, text, target: draft.target, targetName: '', done: false, order: nextOrder(), created: Date.now() };
+        } else {
+          t.text = text;
+          t.target = draft.target;
+          if (t.target) t.detached = false;
+        }
+        closeSheet();
+        commit();
+        if (isNew) toast('Task added');
+      }
+    },
+  });
+  // Re-open this sheet after the picker, keeping what was typed
+  function reopen() { openTaskSheet(taskId, target, { ...draft }); }
+}
+
+function toggleTaskDone(id) {
+  const t = state.tasks[id];
+  if (!t) return;
+  t.done = !t.done;
+  if (t.done) t.order = nextOrder(); // most recently done first in the done list
+  else t.order = nextOrder();
+  commit();
+}
+
+function reorderTask(id, beforeId) {
+  const list = openTasks().sort((a, b) => a.order - b.order).filter((t) => t.id !== id);
+  const moving = state.tasks[id];
+  if (!moving) return;
+  const idx = beforeId ? list.findIndex((t) => t.id === beforeId) : list.length;
+  list.splice(idx < 0 ? list.length : idx, 0, moving);
+  list.forEach((t, i) => { t.order = (i + 1) * 10; });
+  commit();
+}
+
+/* Small list of an item's or container's tasks, for its details sheet */
+function taskSection(kind, id) {
+  const ts = tasksFor(kind, id);
+  return `<div class="field"><span class="label">Tasks</span>
+    ${ts.map((t) => `<div class="row task-mini${t.done ? ' done' : ''}"><input type="checkbox" class="task-check" data-task-done="${t.id}" ${t.done ? 'checked' : ''} aria-label="Done">
+      <button class="p-name" data-task-open="${t.id}">${esc(t.text)}</button></div>`).join('')}
+    <button class="btn small" data-act="add-task">+ Add task</button></div>`;
 }
 
 function renderNeeds() {
@@ -1381,6 +1612,10 @@ function closeSheet() {
 }
 sheetRoot.addEventListener('click', (e) => {
   if (e.target.closest('[data-close]')) { closeSheet(); return; }
+  const td = e.target.closest('[data-task-done]');
+  if (td) { toggleTaskDone(td.dataset.taskDone); drawSheet(); return; }
+  const to = e.target.closest('[data-task-open]');
+  if (to) { openTaskSheet(to.dataset.taskOpen); return; }
   if (sheetCtl && sheetCtl.click) sheetCtl.click(e);
 });
 sheetBody.addEventListener('change', (e) => { if (sheetCtl && sheetCtl.change) sheetCtl.change(e); });
@@ -1456,6 +1691,7 @@ function openItemSheet(id) {
         <div class="row"><span class="grow">${esc(pathText(it.parent))}</span>
         <button class="btn small" data-act="relocate">Move…</button><button class="btn small" data-act="show">Show</button></div></div>
       <div class="field"><button class="btn small" data-act="sugs">Suggestions for this item</button></div>
+      ${taskSection('item', it.id)}
       ${it.plan ? `<div class="field"><span class="label">Planned move</span>
         <div>→ ${esc(pathText(it.plan))}</div>
         <div class="row" style="margin-top:6px"><button class="btn small" data-act="plan-cancel">Cancel plan</button>
@@ -1487,6 +1723,7 @@ function openItemSheet(id) {
         if (act === 'relocate') openPicker({ items: [id] });
         else if (act === 'show') { closeSheet(); reveal(it.parent, id); }
         else if (act === 'sugs') showSuggestionsFor({ kind: 'item', id });
+        else if (act === 'add-task') openTaskSheet(null, { kind: 'item', id });
         else if (act === 'plan-ok') { closeSheet(); applyMove({ items: [id] }, it.plan, 'move'); }
         else if (act === 'plan-cancel') { it.plan = null; commit(); drawSheet(); }
         else if (act === 'delete') {
@@ -1554,6 +1791,7 @@ function openNodeSheet(id) {
       }
       if (!isNew) {
         h += `<div class="field"><button class="btn small" data-act="sugs">Suggestions for ${n.kind === 'room' ? 'this room' : 'everything in here'}</button></div>`;
+        h += taskSection('node', n.id);
       }
       if (!isNew && n.kind === 'room') {
         h += `<div class="field"><span class="label">Order</span><div class="row"><button class="btn small" data-act="up">↑ Earlier</button><button class="btn small" data-act="down">↓ Later</button></div></div>`;
@@ -1598,6 +1836,7 @@ function openNodeSheet(id) {
         }
         if (act === 'relocate') { openPicker({ nodes: [n.id] }); return; }
         if (act === 'sugs') { showSuggestionsFor({ kind: 'node', id: n.id }); return; }
+        if (act === 'add-task') { openTaskSheet(null, { kind: 'node', id: n.id }); return; }
         if (act === 'plan-ok') { closeSheet(); applyMove({ nodes: [n.id] }, n.plan, 'move'); return; }
         if (act === 'plan-cancel') { n.plan = null; }
         if (act === 'up' || act === 'down') {
@@ -1863,6 +2102,7 @@ function openSettings() {
         </div>
         <input type="file" id="f-import" accept=".json,application/json" class="hidden">
         <div class="note" style="margin-top:6px">Importing replaces everything on this device.</div></div>
+      <div class="field"><span class="label">App</span>${installHtml()}</div>
       <div class="field"><span class="label">Tags</span><button class="btn" data-act="tags">Manage tags</button></div>
       <h3 class="set-head">Suggestions</h3>
       <div class="note">Changing any of these clears dismissed suggestions and works them out again.</div>
@@ -1915,6 +2155,12 @@ function openSettings() {
       if (b.dataset.act === 'share') exportBackup(true);
       if (b.dataset.act === 'import') $('#f-import', sheetBody).click();
       if (b.dataset.act === 'tags') openTagManager();
+      if (b.dataset.act === 'install' && installPrompt) {
+        const ev = installPrompt;
+        installPrompt = null;
+        ev.prompt();
+        ev.userChoice.finally(() => { if (sheetCtl) drawSheet(); });
+      }
       if (b.dataset.act === 'set-defaults') { state.settings = Object.assign({}, SETTING_DEFAULTS); state.dismissed = {}; commit(); drawSheet(); toast('Default settings restored'); }
     },
   });
@@ -1969,7 +2215,7 @@ function renameTag(oldTag) {
 
 /* ----- backup ----- */
 function backupBlob() {
-  const data = { app: 'stowed', schema: 1, version: APP_VERSION, exported: new Date().toISOString(), nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings };
+  const data = { app: 'stowed', schema: 1, version: APP_VERSION, exported: new Date().toISOString(), nodes: state.nodes, items: state.items, dismissed: state.dismissed, settings: state.settings, tasks: state.tasks };
   return new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
 }
 function backupName() { return `stowed-backup-${new Date().toISOString().slice(0, 10)}.json`; }
@@ -2022,11 +2268,12 @@ function importBackup(file) {
       ok: 'Replace', danger: true,
       onOk: () => {
         const snap = snapshot();
-        const next = normalize({ nodes: data.nodes, items: data.items, dismissed: data.dismissed, settings: data.settings || state.settings, meta: state.meta });
+        const next = normalize({ nodes: data.nodes, items: data.items, dismissed: data.dismissed, settings: data.settings || state.settings, tasks: data.tasks, meta: state.meta });
         state.nodes = next.nodes;
         state.items = next.items;
         state.dismissed = next.dismissed;
         state.settings = next.settings;
+        state.tasks = next.tasks;
         state.meta.lastImport = { at: Date.now(), exported: data.exported || null };
         ui.selected.clear();
         commit();
@@ -2086,7 +2333,17 @@ function handleAction(action, el) {
     case 'add': openAddSheet(id); break;
     case 'edit-node': openNodeSheet(id); break;
     case 'add-room': openNodeSheet(null); break;
-    case 'fab': openAddSheet(LIMBO); break;
+    case 'fab': if (ui.view === 'tasks' && !ui.search) openTaskSheet(null, null); else openAddSheet(LIMBO); break;
+    case 'task-new': openTaskSheet(null, null); break;
+    case 'task-showdone': ui.showDone = !ui.showDone; render(); break;
+    case 'task-cleardone': {
+      const done = Object.values(state.tasks).filter((t) => t.done);
+      confirmSheet({
+        title: `Delete ${done.length} done task${done.length === 1 ? '' : 's'}?`, ok: 'Delete', danger: true,
+        onOk: () => { const snap = snapshot(); done.forEach((t) => delete state.tasks[t.id]); commit(); toast('Done tasks deleted', snap); },
+      });
+      break;
+    }
     case 'settings': openSettings(); break;
     case 'backup': exportBackup(false); break;
     case 'reveal': reveal(id); break;
@@ -2169,6 +2426,14 @@ function itemTap(id, isGhost) {
 document.addEventListener('click', (e) => {
   if (e.target.closest('#sheet-root') || e.target.closest('#toast')) return;
   if (Date.now() < suppressClickUntil) { suppressClickUntil = 0; e.preventDefault(); e.stopPropagation(); return; }
+  const td = e.target.closest('#app [data-task-done]');
+  if (td) { toggleTaskDone(td.dataset.taskDone); return; }
+  const to = e.target.closest('#app [data-task-open]');
+  if (to) { openTaskSheet(to.dataset.taskOpen); return; }
+  const tf = e.target.closest('#app [data-tfilter]');
+  if (tf) { ui.taskFilter = tf.dataset.tfilter; saveUi(); render(); return; }
+  const tsrt = e.target.closest('#app [data-tsort]');
+  if (tsrt) { ui.taskSort = tsrt.dataset.tsort; saveUi(); render(); return; }
   const sa = e.target.closest('[data-sact]');
   if (sa) { handleSuggestion(sa.dataset.sact, lastSugs[+sa.dataset.sug]); return; }
   const a = e.target.closest('[data-action]');
@@ -2196,11 +2461,14 @@ let autoScrollRaf = null;
 /* Draggable things: tree chips and rows, or chips inside the split sheet. */
 function dragSource(target) {
   if (sheetCtl) return sheetCtl.split ? target.closest('#sheet-body [data-split-drag]') : null;
+  const h = target.closest('#app [data-task-drag]');
+  if (h) return h;
   if (target.closest('.mini-btn')) return null;
   return target.closest('#app [data-drag-item], #app [data-drag-node]');
 }
 
 function payloadFor(el) {
+  if (el.dataset.taskDrag) return { task: el.dataset.taskDrag, items: [], nodes: [] };
   if (el.dataset.splitDrag) return { split: el.dataset.splitDrag, items: [], nodes: [] };
   if (el.dataset.dragItem) {
     const id = el.dataset.dragItem;
@@ -2211,6 +2479,7 @@ function payloadFor(el) {
 }
 function payloadLabel(p, el) {
   if (p.split) return el.textContent;
+  if (p.task) return state.tasks[p.task] ? state.tasks[p.task].text : '';
   const n = p.items.length + p.nodes.length;
   if (n !== 1) return `${n} things`;
   const x = state.items[p.items[0]] || state.nodes[p.nodes[0]];
@@ -2220,12 +2489,12 @@ function payloadLabel(p, el) {
 function startDrag(el, x, y) {
   press = null;
   const payload = payloadFor(el);
-  drag = { payload, el, x, y, startX: x, startY: y, target: null, hoverId: null, hoverSince: 0, split: !!payload.split };
+  drag = { payload, el, x, y, startX: x, startY: y, target: null, hoverId: null, hoverSince: 0, split: !!payload.split, task: !!payload.task };
   const g = $('#drag-ghost');
   g.textContent = payloadLabel(payload, el);
   g.classList.remove('hidden');
   document.body.classList.add('dragging');
-  el.classList.add('dragging-src');
+  (payload.task ? el.closest('[data-task-row]') : el).classList.add('dragging-src');
   if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) { /* ignore */ } }
   moveDrag(x, y);
   if (!drag.split) autoScroll();
@@ -2238,6 +2507,18 @@ function moveDrag(x, y) {
   g.style.top = `${y}px`;
   document.querySelectorAll('.drop-hover').forEach((n) => n.classList.remove('drop-hover'));
   const under = document.elementFromPoint(x, y);
+  document.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+  if (drag.task) {
+    const row = under && under.closest('#app .task-list [data-task-row]');
+    if (!row) { drag.target = null; return; }
+    const r = row.getBoundingClientRect();
+    const after = y > r.top + r.height / 2;
+    row.classList.add(after ? 'drop-after' : 'drop-before');
+    let before = after ? row.nextElementSibling : row;
+    while (before && before.dataset.taskRow === drag.payload.task) before = before.nextElementSibling;
+    drag.target = { before: before && before.dataset.taskRow ? before.dataset.taskRow : null };
+    return;
+  }
   if (drag.split) {
     const side = under && under.closest('#sheet-body [data-split-side]');
     drag.target = side ? side.dataset.splitSide : null;
@@ -2278,11 +2559,13 @@ function endDrag(cancelled) {
   document.body.classList.remove('dragging');
   document.querySelectorAll('.drop-hover').forEach((n) => n.classList.remove('drop-hover'));
   document.querySelectorAll('.dragging-src').forEach((n) => n.classList.remove('dragging-src'));
+  document.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
   // The browser fires a stray click right after a mouse drag ends; swallow only that one.
   suppressClickUntil = Date.now() + 120;
   // A long press released without moving is not a drop.
   const moved = Math.hypot(d.x - d.startX, d.y - d.startY) > 15;
   if (cancelled || !moved || !d.target) return;
+  if (d.task) { reorderTask(d.payload.task, d.target.before); return; }
   if (d.split) { if (sheetCtl && sheetCtl.splitDrop) sheetCtl.splitDrop(d.payload.split, d.target); }
   else promptDrop(d.payload, d.target);
 }
@@ -2294,6 +2577,7 @@ document.addEventListener('touchstart', (e) => {
   const el = dragSource(e.target);
   if (!el) return;
   const t = e.touches[0];
+  if (el.dataset.taskDrag) { startDrag(el, t.clientX, t.clientY); return; } // the handle drags straight away
   press = { el, x: t.clientX, y: t.clientY, timer: setTimeout(() => { if (press) startDrag(press.el, press.x, press.y); }, 380) };
 }, { passive: true });
 
@@ -2332,6 +2616,24 @@ window.addEventListener('pagehide', () => { if (saveTimer) flushSave(); });
 /* ============================================================
    Start
    ============================================================ */
+/* ----- installing ----- */
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  if (sheetCtl) drawSheet();
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; toast('Installed'); if (sheetCtl) drawSheet(); });
+function isStandalone() {
+  return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+}
+function installHtml() {
+  if (isStandalone()) return '<div>Running as an installed app on this device.</div>';
+  if (installPrompt) return '<button class="btn primary" data-act="install">Install app</button>';
+  return `<div class="note">You’re using it in the browser. To install: Chrome menu ⋮ → Install app (Android), or Share → Add to Home Screen (iPhone).
+    If Chrome says it’s already installed, look for Stowed in your app drawer, or uninstall it under Android Settings → Apps → Stowed, then reload this page.</div>`;
+}
+
 async function init() {
   let loaded = null;
   try { loaded = await idbGet('state'); } catch (e) {

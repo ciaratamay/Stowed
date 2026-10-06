@@ -301,3 +301,18 @@ main { padding: 10px 12px; }
 .set-head { font-size: 15px; margin: 20px 0 4px; padding-top: 12px; border-top: 1px solid var(--line); }
 .month-select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); margin: 0 4px; }
 .field > label.check { display: flex; font-size: 15px; color: var(--text); margin-top: 10px; }
+
+/* Tasks */
+.task-bar { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+.task-row { align-items: center; }
+.task-row.done .title { text-decoration: line-through; color: var(--muted); }
+.task-handle { font-size: 22px; color: var(--muted); padding: 4px 6px; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.task-check { width: 22px; height: 22px; flex: 0 0 22px; accent-color: var(--accent); }
+.task-row .grow { cursor: pointer; }
+.task-row.drop-before { box-shadow: 0 -3px 0 var(--accent); }
+.task-row.drop-after { box-shadow: 0 3px 0 var(--accent); }
+.task-group-head { font-weight: 600; margin: 12px 2px 6px; }
+.task-mini { margin: 4px 0; flex-wrap: nowrap; }
+.task-mini .p-name { border: none; background: none; text-align: left; padding: 4px 0; flex: 1; }
+.task-mini.done .p-name { text-decoration: line-through; color: var(--muted); }
+.chip .tmark { margin-left: 5px; color: var(--accent); }

@@ -2,7 +2,7 @@
 
 Home inventory app: what's in each room, where it should go, and searchable in a hurry. Installable web app (PWA), all data stored on the device, with backup files for safekeeping and sharing.
 
-Version 0.5.0: listing, locations, planned moves and suggestions.
+Version 0.6.0: listing, locations, planned moves and suggestions.
 
 ## Put it online (GitHub Pages)
 
@@ -10,7 +10,14 @@ Version 0.5.0: listing, locations, planned moves and suggestions.
 2. Upload every file in this folder to the repository root.
 3. Settings → Pages → Source: "Deploy from a branch", branch `main`, folder `/ (root)`. Save.
 4. Open the address GitHub gives you (e.g. `https://<you>.github.io/stowed/`) on your phone.
-5. Install it: Chrome on Android → menu → "Add to Home screen" / "Install app". Safari on iPhone → Share → "Add to Home Screen".
+5. Install it: Settings (⚙︎) → Install app, or Chrome menu ⋮ → Install app. On iPhone: Share → Add to Home Screen.
+
+**If Chrome says it's already installed but you can't find it:** an earlier install is still registered. Removing a home-screen icon on Android doesn't uninstall the app.
+1. Back up first (Settings → Download backup).
+2. Look for Stowed in your app drawer. If it's there, open it from there.
+3. Otherwise, go to Android Settings → Apps → Stowed → Uninstall, then reload the page in Chrome and install again.
+
+If Android asks whether to also clear Chrome's data for the site, say no, or import your backup afterwards.
 
 After uploading a new version, close and reopen the app (sometimes twice) to pick it up. Your data stays as it is; back up first anyway. The version number is at the bottom of the room list and in Settings.
 
@@ -31,7 +38,15 @@ Everything is stored in the browser's storage on that phone. Nothing is sent any
 - **Containers:** the **⋯** button edits name, emoji, colour (rooms), accessibility, fixed/mobile, and "treat as a group".
 - **Accessibility:** tap the star on a room or storage row to cycle normal → prime → awkward (ladder).
 - **Moving:** long-press a chip or container row, drag it onto a room or container, then choose Move or Propose move. Hovering over a closed row opens it.
-- **Planned moves:** the item stays greyed in its current spot and appears dotted at its destination. Confirm or cancel from either chip, or from the Planned moves tab.
+- **Planned moves:** the item stays greyed in its current spot and appears dotted at its destination. Confirm or cancel from either chip, or in the Tasks tab.
+- **Tasks** tab: to-dos plus planned moves.
+  - Add a task from the tab (+ Task, or the round + button), or from any item, container or room's details ("+ Add task"). A task is your text plus what it's attached to, e.g. "Buy a folder for these" on the Paperwork group.
+  - Filter: All, To do, or Moves.
+  - Sort to-dos by My order (drag the ≡ handle to reorder) or By room.
+  - Tick to mark done; done tasks are hidden behind "Show done", where they can be cleared.
+  - Tap a task to edit its text, change or remove what it's attached to, jump to it (Show), or delete it.
+  - Items show ✎ and containers show "task" when they have open tasks.
+  - If you delete the thing a task is attached to, the task stays, marked "no longer exists". If a group dissolves, its tasks move to the container it was in.
 - **Select:** tap Select, then tap chips to pick several. Then set details for all of them, move them, group them, or delete them.
 - **Groups:** a group needs at least 2 items. If it drops to 1, it's removed and its item stays where the group was.
 - **Deleting a container:** its items go to Limbo; groups inside go to Limbo intact. Deleting a group returns its items to the container it was in. Every delete can be undone from the message that appears.
